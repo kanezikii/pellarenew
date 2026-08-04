@@ -53,65 +53,66 @@ function parseCookies(cookieStr) {
     }).filter(Boolean);
 }
 
-// ── 精准从 UI 提取 EXPIRY 倒计时字符串 (大幅增强版) ────────
+// ── 精准从 UI 提取 EXPIRY 倒计时（快速失败版） ─────────────
 async function fetchExpiryTimeFromUI(page, serverId) {
     try {
-        // 优先使用 /overview 路径（手动截图确认这是完整面板）
         const targetUrl = serverId
             ? `https://www.pella.app/server/${serverId}/overview`
             : 'https://www.pella.app/home';
 
         console.log(`🔍 打开页面读取 EXPIRY 时间: ${targetUrl}`);
-        await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 45000 }).catch(() => {
-            console.log('⚠️ networkidle 超时，继续尝试...');
+        
+        // 使用 domcontentloaded，避免 networkidle 在 SPA 上挂死
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch((e) => {
+            console.log(`⚠️ goto 超时或失败: ${e.message}`);
         });
-        await sleep(6000);
+        await sleep(4500);
 
-        // 滚动到底部，触发懒加载
+        // 滚动一下
         await page.evaluate(() => {
             window.scrollTo(0, document.body.scrollHeight);
             window.scrollTo(0, 0);
-        });
-        await sleep(2000);
+        }).catch(() => {});
+        await sleep(1500);
 
-        // 主动等待 expires 文字出现（最多再等 20 秒）
+        // 短暂等待 expires 文本（最多 12 秒）
         try {
             await page.waitForFunction(() => {
                 const t = (document.body.innerText || '').toLowerCase();
                 return t.includes('expires') || t.includes('expiry') || /\d+\s*[dh]\s*\d+\s*[hm]/.test(t);
-            }, { timeout: 20000 });
+            }, { timeout: 12000 });
             console.log('✅ 检测到 expires 相关文本');
         } catch (e) {
             console.log('⚠️ 等待 expires 文本超时，继续尝试提取...');
         }
 
-        await sleep(2000);
+        await sleep(1000);
 
         const result = await page.evaluate(() => {
             const bodyText = (document.body.innerText || '').replace(/\s+/g, ' ').trim();
 
-            // 主匹配（与手动截图完全一致）
+            // 主匹配
             let match = bodyText.match(/Your server expires in\s*([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/i);
-            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 800) };
+            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 600) };
 
-            // 备用宽松匹配
+            // 宽松匹配
             match = bodyText.match(/expires?\s+in\s*([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/i);
-            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 800) };
+            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 600) };
 
             match = bodyText.match(/([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/);
-            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 800) };
+            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 600) };
 
-            // 遍历所有元素，找包含 expires 的节点
+            // 遍历元素
             const all = document.querySelectorAll('div, p, span, section');
             for (const el of all) {
                 const txt = (el.innerText || '').trim();
-                if (txt.toLowerCase().includes('expires in') && txt.length < 120) {
+                if (txt.toLowerCase().includes('expires in') && txt.length < 150) {
                     const m = txt.match(/([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/i);
                     if (m) return { expiry: m[1].replace(/\s+/g, ' ').trim(), snippet: txt };
                 }
             }
 
-            return { expiry: null, snippet: bodyText.substring(0, 800) };
+            return { expiry: null, snippet: bodyText.substring(0, 600) };
         });
 
         if (result.expiry) {
@@ -454,6 +455,9 @@ async function handleFitnesstipz(page) {
 
 // ── 主测试 ──────────────────────────────────────────────────
 test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力EXPIRY）', async () => {
+    // 关键：把整个测试超时提升到 5 分钟，防止被默认 120s 杀掉
+    test.setTimeout(300000);
+
     if (accounts.length === 0) {
         throw new Error('❌ 未找到任何账号配置，请检查 PELLA_ACCOUNTS');
     }
@@ -615,7 +619,6 @@ test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力
                 await page.goto(renewLink, { waitUntil: 'domcontentloaded' });
                 await sleep(4000);
 
-                // 检查当前页面状态
                 const initialText = await page.evaluate(() => (document.body.innerText || '').substring(0, 300));
                 console.log(`📄 当前页面文本片段: ${initialText.replace(/\n/g, ' ')}`);
 
@@ -631,7 +634,6 @@ test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力
                         const curUrl = page.url();
                         const text = await page.evaluate(() => (document.body.innerText || '').substring(0, 400));
 
-                        // 成功标志：不再显示 Claiming，或跳转到 server/home，或出现 expires / Claimed
                         const noLongerClaiming = !text.includes('Claiming');
                         const backToServer = curUrl.includes('/server/') || curUrl.includes('/home') || curUrl.includes('/overview');
                         const hasSuccessHint = text.toLowerCase().includes('expires') || text.includes('Claimed') || text.includes('success');
@@ -643,7 +645,6 @@ test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力
                             break;
                         }
 
-                        // 每 8 秒尝试点击可能的按钮
                         if (t > 0 && t % 8 === 0) {
                             await page.evaluate(() => {
                                 document.querySelectorAll('button, a, [role="button"], .btn').forEach(el => {
@@ -661,7 +662,7 @@ test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力
                         await page.screenshot({ path: `claiming_timeout_${email.replace(/[^a-z0-9]/gi, '_')}_${i}.png` }).catch(() => {});
                     }
                 }
-                // ========== 模式2：外部广告短链流程（兼容旧逻辑） ==========
+                // ========== 模式2：外部广告短链流程 ==========
                 else {
                     console.log('⏳ 未检测到 Claiming，尝试外部广告跳转流程...');
                     let adDomainVisited = false;
@@ -694,7 +695,6 @@ test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力
                     }
 
                     if (adDomainVisited) {
-                        // 处理 CF / fitnesstipz / tpi.li（原有逻辑）
                         const hasTurnstile = await page.evaluate('!!document.querySelector("input[name=\'cf-turnstile-response\']")');
                         if (hasTurnstile) {
                             console.log('🛡️ 检测到 CF Turnstile...');
@@ -736,7 +736,6 @@ test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力
                             } catch (e) {}
                         }
 
-                        // 等待返回 pella
                         for (let waitSec = 0; waitSec < 20; waitSec++) {
                             await sleep(1000);
                             const curUrl = page.url();
