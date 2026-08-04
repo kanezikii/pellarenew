@@ -46,7 +46,7 @@ jobs:
 
       - name: 🚀 运行续期脚本
         env:
-          PELLA_ACCOUNT: ${{ secrets.PELLA_ACCOUNTS }}
+          PELLA_ACCOUNTS: ${{ secrets.PELLA_ACCOUNTS }} # 👈 这里修改为复数 PELLA_ACCOUNTS
           TG_BOT:        ${{ secrets.TG_BOT }}
           GOST_PROXY:    http://127.0.0.1:8080
         run: |
