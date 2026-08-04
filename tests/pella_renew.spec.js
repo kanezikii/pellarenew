@@ -55,6 +55,93 @@ function parseCookies(cookieStr) {
     }).filter(Boolean);
 }
 
+// ── 工具函数：获取服务器剩余时间 ────────────────────────────
+async function fetchExpiryTime(page, token) {
+    try {
+        // 优先从 API 查询精确时间
+        if (token) {
+            const serversRes = await page.evaluate(async (t) => {
+                try {
+                    const res = await fetch('https://api.pella.app/user/servers', {
+                        headers: { 'Authorization': `Bearer ${t}` }
+                    });
+                    return await res.json();
+                } catch { return null; }
+            }, token);
+
+            if (serversRes && serversRes.servers && serversRes.servers.length > 0) {
+                const server = serversRes.servers[0];
+                if (server.expires_at) {
+                    const diffMs = new Date(server.expires_at) - new Date();
+                    if (diffMs > 0) {
+                        const totalHours = Math.floor(diffMs / (1000 * 60 * 60));
+                        const mins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+                        const days = Math.floor(totalHours / 24);
+                        const hours = totalHours % 24;
+                        return `${days}D ${hours}H ${mins}M`;
+                    }
+                }
+            }
+        }
+
+        // 备选方案：从网页 DOM 文本匹配 "expires in"
+        await page.goto('https://www.pella.app/home', { waitUntil: 'domcontentloaded' }).catch(() => {});
+        await sleep(2000);
+        const pageText = await page.evaluate(() => document.body.innerText || '');
+        const match = pageText.match(/expires in\s+([0-9a-z\s]+)/i);
+        if (match) {
+            return match[1].trim();
+        }
+    } catch (e) {
+        console.log(`⚠️ 获取剩余时间失败: ${e.message}`);
+    }
+    return '未知';
+}
+
+// ── 合并发送 Telegram 汇总通知 ──────────────────────────────
+function sendSummaryTG(results) {
+    return new Promise((resolve) => {
+        if (!TG_CHAT_ID || !TG_TOKEN) {
+            console.log('⚠️ TG_BOT 未配置，跳过推送');
+            return resolve();
+        }
+        const lines = [
+            `🎮 Pella 自动续期汇总通知`,
+            `🕐 运行时间: ${nowStr()}`,
+            `──────────────────────────`,
+        ];
+
+        results.forEach((item, index) => {
+            lines.push(`👤 账号 ${index + 1}: ${item.email}`);
+            lines.push(`📊 结果: ${item.status}`);
+            if (item.expiry) {
+                lines.push(`⏳ 剩余时间: ${item.expiry}`);
+            }
+            if (item.extra) {
+                lines.push(`ℹ️ 详情: ${item.extra}`);
+            }
+            if (index < results.length - 1) {
+                lines.push(`──────────────────────────`);
+            }
+        });
+
+        const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: lines.join('\n') });
+        const req = https.request({
+            hostname: 'api.telegram.org',
+            path: `/bot${TG_TOKEN}/sendMessage`,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        }, (res) => {
+            console.log(res.statusCode === 200 ? '📨 TG 汇总推送成功' : `⚠️ TG 推送失败：HTTP ${res.statusCode}`);
+            resolve();
+        });
+        req.on('error', e => { console.log(`⚠️ TG 推送异常：${e.message}`); resolve(); });
+        req.setTimeout(15000, () => { console.log('⚠️ TG 推送超时'); req.destroy(); resolve(); });
+        req.write(body);
+        req.end();
+    });
+}
+
 // ── 广告拦截脚本 ─────────────────────────────────────────────
 const AD_BLOCK_SCRIPT = `
 (function() {
@@ -156,36 +243,6 @@ function nowStr() {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function sendTG(email, result, extra = '') {
-    return new Promise((resolve) => {
-        if (!TG_CHAT_ID || !TG_TOKEN) {
-            console.log('⚠️ TG_BOT 未配置，跳过推送');
-            return resolve();
-        }
-        const lines = [
-            `🎮 Pella 续期通知`,
-            `🕐 运行时间: ${nowStr()}`,
-            `👤 账号: ${email}`,
-            `📊 续期结果: ${result}`,
-        ];
-        if (extra) lines.push(extra);
-        const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: lines.join('\n') });
-        const req = https.request({
-            hostname: 'api.telegram.org',
-            path: `/bot${TG_TOKEN}/sendMessage`,
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-        }, (res) => {
-            console.log(res.statusCode === 200 ? '📨 TG 推送成功' : `⚠️ TG 推送失败：HTTP ${res.statusCode}`);
-            resolve();
-        });
-        req.on('error', e => { console.log(`⚠️ TG 推送异常：${e.message}`); resolve(); });
-        req.setTimeout(15000, () => { console.log('⚠️ TG 推送超时'); req.destroy(); resolve(); });
-        req.write(body);
-        req.end();
-    });
-}
 
 function xdotoolClick(x, y) {
     x = Math.round(x);
@@ -383,13 +440,15 @@ async function handleFitnesstipz(page) {
     return true;
 }
 
-// ── 循环处理账号 ─────────────────────────────────────────────
-for (const [email, secretVal] of accounts) {
-    test(`Pella 自动续期 - ${email}`, async () => {
-        if (!email || !secretVal) {
-            throw new Error(`❌ 账号配置无效: email=${email}`);
-        }
+// ── 主测试：批量顺序处理并合并通知 ─────────────────────────
+test('Pella 多账号自动续期（合并通知版）', async () => {
+    if (accounts.length === 0) {
+        throw new Error('❌ 未找到任何账号配置，请检查 PELLA_ACCOUNTS');
+    }
 
+    const summaryResults = []; // 存储所有账号运行结果
+
+    for (const [email, secretVal] of accounts) {
         console.log(`\n===========================================`);
         console.log(`🚀 开始处理账号: ${email}`);
         console.log(`===========================================\n`);
@@ -432,7 +491,8 @@ for (const [email, secretVal] of accounts) {
 
         const page = await context.newPage();
         page.setDefaultTimeout(TIMEOUT);
-        console.log('🚀 浏览器就绪！');
+
+        let currentToken = null;
 
         try {
             console.log('🌐 验证出口 IP...');
@@ -458,7 +518,7 @@ for (const [email, secretVal] of accounts) {
                 }
 
                 if (!hasSession) {
-                    throw new Error('❌ Cookie 注入后未能生成有效 Session！请重新抓取并更新 Cookie。');
+                    throw new Error('Cookie 注入后未能生成有效 Session，请更新 Cookie！');
                 }
                 console.log(`✅ Cookie 免密登录成功！当前页面：${page.url()}`);
             } else {
@@ -492,7 +552,7 @@ for (const [email, secretVal] of accounts) {
                 await sleep(500);
             }
 
-            // ── 抓取最新 Cookie 并写入更新文件 ────────────────────────
+            // 抓取并存回最新 Cookie
             try {
                 const latestCookies = await context.cookies(['https://www.pella.app', 'https://clerk.pella.app']);
                 const cookieStr = latestCookies.map(c => `${c.name}=${c.value}`).join('; ');
@@ -500,13 +560,12 @@ for (const [email, secretVal] of accounts) {
                     updateSavedAccountSecret(email, `cookie:${cookieStr}`);
                 }
             } catch (err) {
-                console.log(`⚠️ 抓取最新 Cookie 失败，跳过更新: ${err.message}`);
+                console.log(`⚠️ 抓取最新 Cookie 失败: ${err.message}`);
             }
 
             console.log('🔑 获取 JWT token...');
-            const token = await page.evaluate('window.Clerk && window.Clerk.session ? window.Clerk.session.getToken() : null');
-            if (!token) throw new Error('❌ 无法获取 Clerk token（Session 不可用）');
-            console.log('✅ Token 获取成功');
+            currentToken = await page.evaluate('window.Clerk && window.Clerk.session ? window.Clerk.session.getToken() : null');
+            if (!currentToken) throw new Error('无法获取 Clerk token');
 
             console.log('🔍 获取服务器续期链接...');
             const serversRes = await page.evaluate(async (t) => {
@@ -514,10 +573,10 @@ for (const [email, secretVal] of accounts) {
                     headers: { 'Authorization': `Bearer ${t}` }
                 });
                 return await res.json();
-            }, token);
+            }, currentToken);
 
             const servers = serversRes.servers || [];
-            if (servers.length === 0) throw new Error('❌ 未找到服务器');
+            if (servers.length === 0) throw new Error('未找到服务器');
 
             let renewLink = null;
             for (const server of servers) {
@@ -530,9 +589,15 @@ for (const [email, secretVal] of accounts) {
             }
 
             if (!renewLink) {
-                await sendTG(email, '⚠️ 无可用续期链接，今日已续期或暂不需要续期');
-                console.log('⚠️ 无可用续期链接，退出');
-                return;
+                const expiryTime = await fetchExpiryTime(page, currentToken);
+                summaryResults.push({
+                    email,
+                    status: '⚠️ 无可用续期链接，今日已续期或暂不需要续期',
+                    expiry: expiryTime
+                });
+                console.log('⚠️ 无可用续期链接');
+                await browser.close();
+                continue;
             }
 
             console.log(`🌐 访问广告链接: ${renewLink}`);
@@ -543,10 +608,7 @@ for (const [email, secretVal] of accounts) {
             if (hasTurnstile) {
                 console.log('🛡️ 检测到 CF Turnstile，开始处理...');
                 const cfOk = await solveTurnstile(page);
-                if (!cfOk) {
-                    await sendTG(email, '❌ CF Turnstile 验证失败');
-                    throw new Error('❌ CF Turnstile 验证失败');
-                }
+                if (!cfOk) throw new Error('CF Turnstile 验证失败');
             }
 
             console.log('📤 点击 Continue...');
@@ -563,10 +625,7 @@ for (const [email, secretVal] of accounts) {
                 loopCount++;
                 console.log(`🔄 处理第 ${loopCount} 个中转页...`);
                 const ok = await handleFitnesstipz(page);
-                if (!ok) {
-                    await sendTG(email, '❌ 中转页处理失败');
-                    throw new Error('❌ 中转页处理失败');
-                }
+                if (!ok) throw new Error('中转页处理失败');
                 await sleep(3000);
             }
 
@@ -580,8 +639,7 @@ for (const [email, secretVal] of accounts) {
                             return el ? el.textContent.trim() : '0';
                         })()
                     `);
-                    const timerVal = parseInt(timerText) || 0;
-                    if (timerVal <= 0) break;
+                    if ((parseInt(timerText) || 0) <= 0) break;
                 }
 
                 console.log('🔍 获取 renew 链接...');
@@ -594,8 +652,7 @@ for (const [email, secretVal] of accounts) {
 
                 if (!renewHref || !renewHref.includes('/renew/')) {
                     await page.screenshot({ path: `no_renew_href_${email}.png` });
-                    await sendTG(email, '❌ 未找到 renew 链接');
-                    throw new Error('❌ 未找到有效 renew 链接: ' + renewHref);
+                    throw new Error('未找到有效 renew 链接: ' + renewHref);
                 }
 
                 console.log(`✅ 找到 renew 链接: ${renewHref}`);
@@ -614,20 +671,37 @@ for (const [email, secretVal] of accounts) {
             console.log(`📄 最终地址: ${finalUrl}`);
             await page.screenshot({ path: `final_result_${email}.png` });
 
+            // 续期后刷新获取最新的剩余时间
+            const latestExpiryTime = await fetchExpiryTime(page, currentToken);
+
             if (finalUrl.includes('/renew/')) {
                 console.log('🎉 续期成功！');
-                await sendTG(email, '✅ 续期成功！');
+                summaryResults.push({
+                    email,
+                    status: '✅ 续期成功！',
+                    expiry: latestExpiryTime
+                });
             } else {
-                console.log(`⚠️ 续期结果未知: ${finalUrl}`);
-                await sendTG(email, '⚠️ 续期结果未知', `🔗 最终URL: ${finalUrl}`);
+                summaryResults.push({
+                    email,
+                    status: '⚠️ 续期结果未知',
+                    expiry: latestExpiryTime,
+                    extra: `🔗 ${finalUrl}`
+                });
             }
 
         } catch (e) {
             await page.screenshot({ path: `error_${email}.png` }).catch(() => {});
-            await sendTG(email, `❌ 脚本异常：${e.message}`);
-            throw e;
+            summaryResults.push({
+                email,
+                status: `❌ 脚本异常: ${e.message}`,
+                expiry: '获取失败'
+            });
         } finally {
             await browser.close();
         }
-    });
-}
+    }
+
+    // ── 所有账号完成后，统一发送 1 条 Telegram 汇总通知 ───────
+    await sendSummaryTG(summaryResults);
+});
