@@ -62,47 +62,41 @@ async function fetchExpiryTimeFromUI(page, serverId) {
 
         console.log(`🔍 打开页面读取 EXPIRY 时间: ${targetUrl}`);
         
-        // 使用 domcontentloaded，避免 networkidle 在 SPA 上挂死
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch((e) => {
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch((e) => {
             console.log(`⚠️ goto 超时或失败: ${e.message}`);
         });
-        await sleep(4500);
+        await sleep(4000);
 
-        // 滚动一下
         await page.evaluate(() => {
             window.scrollTo(0, document.body.scrollHeight);
             window.scrollTo(0, 0);
         }).catch(() => {});
         await sleep(1500);
 
-        // 短暂等待 expires 文本（最多 12 秒）
         try {
             await page.waitForFunction(() => {
                 const t = (document.body.innerText || '').toLowerCase();
                 return t.includes('expires') || t.includes('expiry') || /\d+\s*[dh]\s*\d+\s*[hm]/.test(t);
-            }, { timeout: 12000 });
+            }, { timeout: 10000 });
             console.log('✅ 检测到 expires 相关文本');
         } catch (e) {
             console.log('⚠️ 等待 expires 文本超时，继续尝试提取...');
         }
 
-        await sleep(1000);
+        await sleep(800);
 
         const result = await page.evaluate(() => {
             const bodyText = (document.body.innerText || '').replace(/\s+/g, ' ').trim();
 
-            // 主匹配
             let match = bodyText.match(/Your server expires in\s*([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/i);
             if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 600) };
 
-            // 宽松匹配
             match = bodyText.match(/expires?\s+in\s*([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/i);
             if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 600) };
 
             match = bodyText.match(/([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/);
             if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 600) };
 
-            // 遍历元素
             const all = document.querySelectorAll('div, p, span, section');
             for (const el of all) {
                 const txt = (el.innerText || '').trim();
@@ -171,7 +165,7 @@ function sendSummaryTG(results) {
     });
 }
 
-// ── 广告拦截脚本 ─────────────────────────────────────────────
+// ── 广告拦截脚本（已去掉 window.open 禁用！） ────────────────
 const AD_BLOCK_SCRIPT = `
 (function() {
     'use strict';
@@ -189,7 +183,7 @@ const AD_BLOCK_SCRIPT = `
         });
     }).observe(document.documentElement, { childList: true, subtree: true });
     function init() {
-        window.open = () => null;
+        // 注意：已移除 window.open = () => null;  避免卡住 Claiming
         document.addEventListener('click', e => {
             const a = e.target.closest('a');
             if (!a) return;
@@ -455,8 +449,7 @@ async function handleFitnesstipz(page) {
 
 // ── 主测试 ──────────────────────────────────────────────────
 test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力EXPIRY）', async () => {
-    // 关键：把整个测试超时提升到 5 分钟，防止被默认 120s 杀掉
-    test.setTimeout(300000);
+    test.setTimeout(300000); // 5 分钟
 
     if (accounts.length === 0) {
         throw new Error('❌ 未找到任何账号配置，请检查 PELLA_ACCOUNTS');
@@ -624,12 +617,12 @@ test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力
 
                 let claimSuccess = false;
 
-                // ========== 模式1：内部 Claiming... 流程 ==========
+                // ========== 模式1：内部 Claiming... 流程（已优化） ==========
                 if (initialText.includes('Claiming') || page.url().includes('/renew/')) {
-                    console.log('🔄 检测到内部 Claiming... 流程，开始耐心等待完成（最多90秒）...');
+                    console.log('🔄 检测到内部 Claiming... 流程，开始等待（最多60秒）...');
                     await page.screenshot({ path: `claiming_start_${email.replace(/[^a-z0-9]/gi, '_')}_${i}.png` }).catch(() => {});
 
-                    for (let t = 0; t < 90; t++) {
+                    for (let t = 0; t < 60; t++) {
                         await sleep(1000);
                         const curUrl = page.url();
                         const text = await page.evaluate(() => (document.body.innerText || '').substring(0, 400));
@@ -645,20 +638,31 @@ test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力
                             break;
                         }
 
-                        if (t > 0 && t % 8 === 0) {
+                        // 每 10 秒尝试推动流程
+                        if (t > 0 && t % 10 === 0) {
+                            console.log(`🔄 第 ${t} 秒仍卡在 Claiming，尝试刷新/点击...`);
+                            // 尝试点击页面中心
+                            await page.mouse.click(960, 540).catch(() => {});
+                            // 尝试点击任何可能的按钮
                             await page.evaluate(() => {
-                                document.querySelectorAll('button, a, [role="button"], .btn').forEach(el => {
+                                document.querySelectorAll('button, a, [role="button"], .btn, div').forEach(el => {
                                     const t = (el.innerText || el.textContent || '').toLowerCase();
-                                    if (t.includes('continue') || t.includes('claim') || t.includes('get') || t.includes('confirm')) {
+                                    if (t.includes('continue') || t.includes('claim') || t.includes('get') || t.includes('confirm') || t.includes('claiming')) {
                                         try { el.click(); } catch (e) {}
                                     }
                                 });
                             }).catch(() => {});
+                            // 第 30 秒强制刷新一次
+                            if (t === 30) {
+                                console.log('🔄 强制刷新 Claiming 页面...');
+                                await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+                                await sleep(3000);
+                            }
                         }
                     }
 
                     if (!claimSuccess) {
-                        console.log('⚠️ 内部 Claiming 流程超时（90秒）');
+                        console.log('⚠️ 内部 Claiming 流程超时（60秒）');
                         await page.screenshot({ path: `claiming_timeout_${email.replace(/[^a-z0-9]/gi, '_')}_${i}.png` }).catch(() => {});
                     }
                 }
@@ -667,7 +671,7 @@ test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力
                     console.log('⏳ 未检测到 Claiming，尝试外部广告跳转流程...');
                     let adDomainVisited = false;
 
-                    for (let waitSec = 0; waitSec < 25; waitSec++) {
+                    for (let waitSec = 0; waitSec < 20; waitSec++) {
                         const curUrl = page.url();
                         if (
                             curUrl.includes('tpi.li') ||
