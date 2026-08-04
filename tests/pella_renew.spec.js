@@ -55,39 +55,49 @@ function parseCookies(cookieStr) {
     }).filter(Boolean);
 }
 
-// ── 直接从 UI 界面 EXPIRY 框读取剩余时间 ──────────────────────
-async function fetchExpiryTimeFromUI(page) {
+// ── 从服务器详情页 (server/xxx) 精准抓取 EXPIRY 时间 ─────────
+async function fetchExpiryTimeFromUI(page, serverId) {
     try {
-        if (!page.url().includes('/home') && !page.url().includes('/server/')) {
-            await page.goto('https://www.pella.app/home', { waitUntil: 'domcontentloaded' }).catch(() => {});
-            await sleep(2500);
-        }
+        const targetUrl = serverId 
+            ? `https://www.pella.app/server/${serverId}` 
+            : 'https://www.pella.app/home';
+        
+        console.log(`🔍 跳转至服务器详情页读取时间: ${targetUrl}`);
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+        await sleep(3500); // 预留 DOM 渲染时间
 
         const expiry = await page.evaluate(() => {
-            // 在页面所有元素中寻找包含 "Your server expires in" 的文本节点
-            const allElements = Array.from(document.querySelectorAll('*'));
-            const targetEl = allElements.find(el => el.innerText && el.innerText.includes('Your server expires in'));
-            
-            if (targetEl) {
-                const match = targetEl.innerText.match(/Your server expires in\s+([0-9a-zA-Z\s]+)/i);
-                if (match) {
-                    return match[1].replace(/\.$/, '').trim(); // 提取如 "0D 14H 51M"
+            // 1. 寻找包含 "Your server expires in" 的文本节点
+            const allElems = Array.from(document.querySelectorAll('*'));
+            for (const el of allElems) {
+                if (el.children.length === 0 || el.tagName === 'SPAN' || el.tagName === 'P') {
+                    const txt = el.textContent || '';
+                    if (txt.includes('Your server expires in')) {
+                        const m = txt.match(/Your server expires in\s+([0-9A-Za-z\s]+?)(?=\.|$)/i);
+                        if (m) return m[1].trim();
+                    }
                 }
             }
 
-            // 备用正则全局匹配
-            const bodyMatch = document.body.innerText.match(/expires in\s+([0-9a-zA-Z\s]+)/i);
-            return bodyMatch ? bodyMatch[1].replace(/\.$/, '').trim() : null;
+            // 2. 正则兜底全局匹配
+            const fullText = document.body.innerText || '';
+            const match1 = fullText.match(/Your server expires in\s+([0-9A-Za-z\s]+?)(?=\.|$)/i);
+            if (match1) return match1[1].trim();
+
+            const match2 = fullText.match(/expires in\s+([0-9A-Za-z\s]+?)(?=\.|$)/i);
+            if (match2) return match2[1].trim();
+
+            return null;
         });
 
         return expiry || '未获取到时间';
     } catch (e) {
-        console.log(`⚠️ 读取 EXPIRY 文本失败: ${e.message}`);
+        console.log(`⚠️ 读取 EXPIRY 文本异常: ${e.message}`);
         return '读取失败';
     }
 }
 
-// ── 合并发送 Telegram 汇总通知 ──────────────────────────────
+// ── 发送 Telegram 汇总通知 ──────────────────────────────────
 function sendSummaryTG(results) {
     return new Promise((resolve) => {
         if (!TG_CHAT_ID || !TG_TOKEN) {
@@ -430,7 +440,7 @@ async function handleFitnesstipz(page) {
 }
 
 // ── 主测试 ──────────────────────────────────────────────────
-test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', async () => {
+test('Pella 多账号自动续期（真重定向 + 精准抓取 UI 时间版）', async () => {
     if (accounts.length === 0) {
         throw new Error('❌ 未找到任何账号配置，请检查 PELLA_ACCOUNTS');
     }
@@ -480,6 +490,8 @@ test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', 
 
         const page = await context.newPage();
         page.setDefaultTimeout(TIMEOUT);
+
+        let serverId = null;
 
         try {
             console.log('🌐 验证出口 IP...');
@@ -539,7 +551,7 @@ test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', 
                 await sleep(500);
             }
 
-            // 抓取并更新本地 Secrets
+            // 抓取并更新最新 Cookie 到本地队列
             try {
                 const latestCookies = await context.cookies(['https://www.pella.app', 'https://clerk.pella.app']);
                 const cookieStr = latestCookies.map(c => `${c.name}=${c.value}`).join('; ');
@@ -554,7 +566,7 @@ test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', 
             const token = await page.evaluate('window.Clerk && window.Clerk.session ? window.Clerk.session.getToken() : null');
             if (!token) throw new Error('无法获取 Clerk token');
 
-            console.log('🔍 获取服务器续期链接...');
+            console.log('🔍 获取服务器信息...');
             const serversRes = await page.evaluate(async (t) => {
                 const res = await fetch('https://api.pella.app/user/servers', {
                     headers: { 'Authorization': `Bearer ${t}` }
@@ -565,7 +577,10 @@ test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', 
             const servers = serversRes.servers || [];
             if (servers.length === 0) throw new Error('未找到服务器');
 
-            // 提取所有未领取的链接（解决多按钮未领完问题）
+            serverId = servers[0].id || servers[0]._id || null;
+            console.log(`🖥️ 服务器 ID: ${serverId}`);
+
+            // 提取所有未领取的续期链接
             const unclaimedLinks = [];
             for (const server of servers) {
                 const unclaimed = (server.renew_links || []).filter(l => l.claimed === false);
@@ -575,7 +590,7 @@ test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', 
             }
 
             if (unclaimedLinks.length === 0) {
-                const expiryTime = await fetchExpiryTimeFromUI(page);
+                const expiryTime = await fetchExpiryTimeFromUI(page, serverId);
                 summaryResults.push({
                     email,
                     status: '⚠️ 无可用续期链接，今日已续期',
@@ -594,8 +609,27 @@ test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', 
                 console.log(`\n🌐 [${i + 1}/${unclaimedLinks.length}] 处理链接: ${renewLink}`);
 
                 await page.goto(renewLink, { waitUntil: 'domcontentloaded' });
-                await sleep(3000);
+                await sleep(2000);
 
+                // 核心修复：等待页面真正重定向跳出 pella.app 走向广告短链域名 (tpi.li / fitnesstipz.com)
+                console.log('⏳ 等待跳转至广告/中转域名...');
+                for (let waitSec = 0; waitSec < 12; waitSec++) {
+                    const curUrl = page.url();
+                    if (curUrl.includes('tpi.li') || curUrl.includes('fitnesstipz.com')) {
+                        console.log(`✅ 已成功跳转至短链页: ${curUrl}`);
+                        break;
+                    }
+                    // 若停留在 pella.app 页面，点击页面上存在的 Claim/Continue 按钮强行触发展开
+                    const clicked = await page.evaluate(() => {
+                        const a = document.querySelector('a[href*="tpi.li"], a[href*="fitnesstipz"], a.btn, button');
+                        if (a) { a.click(); return true; }
+                        return false;
+                    });
+                    if (clicked) console.log('👆 已自动点击 Pella 页面上的跳转按钮');
+                    await sleep(1000);
+                }
+
+                // 处理 CF Turnstile 验证
                 const hasTurnstile = await page.evaluate('!!document.querySelector("input[name=\'cf-turnstile-response\']")');
                 if (hasTurnstile) {
                     console.log('🛡️ 检测到 CF Turnstile，开始处理...');
@@ -603,24 +637,29 @@ test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', 
                     if (!cfOk) throw new Error(`第 ${i + 1} 个链接 CF 验证失败`);
                 }
 
-                console.log('📤 点击 Continue...');
-                try {
-                    await page.waitForSelector('#continue', { timeout: 10000 });
-                    await page.click('#continue');
-                    await sleep(3000);
-                } catch (e) {
-                    console.log(`⚠️ #continue 未找到：${e.message}`);
+                // 点击 #continue
+                if (page.url().includes('tpi.li') || page.url().includes('fitnesstipz')) {
+                    console.log('📤 点击 Continue...');
+                    try {
+                        await page.waitForSelector('#continue', { timeout: 10000 });
+                        await page.click('#continue');
+                        await sleep(3000);
+                    } catch (e) {
+                        console.log(`⚠️ #continue 未找到：${e.message}`);
+                    }
                 }
 
+                // 处理多重 fitnesstipz 中转页
                 let loopCount = 0;
                 while (page.url().includes('fitnesstipz.com') && loopCount < 5) {
                     loopCount++;
-                    console.log(`🔄 处理第 ${loopCount} 个中转页...`);
+                    console.log(`🔄 处理第 ${loopCount} 个 fitnesstipz 中转页...`);
                     const ok = await handleFitnesstipz(page);
                     if (!ok) throw new Error(`第 ${i + 1} 个链接中转页处理失败`);
                     await sleep(3000);
                 }
 
+                // 处理 tpi.li 倒计时与 Get Link 点击
                 if (page.url().includes('tpi.li')) {
                     console.log('⏳ 等待 tpi.li 倒计时...');
                     for (let k = 0; k < 60; k++) {
@@ -644,7 +683,7 @@ test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', 
 
                     if (!renewHref || !renewHref.includes('/renew/')) {
                         await page.screenshot({ path: `no_renew_href_${email}_${i}.png` });
-                        throw new Error(`第 ${i + 1} 个链接未找到有效 renew 跳转地址`);
+                        throw new Error(`第 ${i + 1} 个链接未找到有效 renew 地址`);
                     }
 
                     console.log(`✅ 找到 renew 链接: ${renewHref}`);
@@ -652,22 +691,21 @@ test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', 
                     await sleep(3000);
                 }
 
-                console.log('⏳ 等待续期跳转完成...');
-                try {
-                    await page.waitForURL(/pella\.app\/renew\//, { timeout: 15000 });
-                    successCount++;
-                    console.log(`🎉 第 ${i + 1} 个链接续期成功！`);
-                } catch {
-                    console.log(`⚠️ 未检测到 renew 跳转，当前: ${page.url()}`);
+                // 等待最终成功跳回 Pella 页面
+                console.log('⏳ 等待完成并重定向回 Pella...');
+                for (let waitSec = 0; waitSec < 20; waitSec++) {
+                    await sleep(1000);
+                    const curUrl = page.url();
+                    if (curUrl.includes('pella.app') && !curUrl.includes('tpi.li') && !curUrl.includes('fitnesstipz')) {
+                        console.log(`🎉 第 ${i + 1} 个链接完成，成功返回 Pella: ${curUrl}`);
+                        successCount++;
+                        break;
+                    }
                 }
             }
 
-            // 续期完成后返回 Dashboard 抓取最新准确的 EXPIRY 文本
-            console.log('🔍 正在抓取最新网页上的 EXPIRY 时间...');
-            await page.goto('https://www.pella.app/home', { waitUntil: 'domcontentloaded' }).catch(() => {});
-            await sleep(3000);
-            const latestExpiryTime = await fetchExpiryTimeFromUI(page);
-
+            // 续期完成后跳转到 /server/${serverId} 精准抓取 UI 上的 EXPIRY 字符串
+            const latestExpiryTime = await fetchExpiryTimeFromUI(page, serverId);
             await page.screenshot({ path: `final_result_${email}.png` });
 
             summaryResults.push({
@@ -678,16 +716,17 @@ test('Pella 多账号自动续期（完全清空链接 + UI抓取时间版）', 
 
         } catch (e) {
             await page.screenshot({ path: `error_${email}.png` }).catch(() => {});
+            const latestExpiryTime = await fetchExpiryTimeFromUI(page, serverId);
             summaryResults.push({
                 email,
                 status: `❌ 脚本异常: ${e.message}`,
-                expiry: '获取失败'
+                expiry: latestExpiryTime
             });
         } finally {
             await browser.close();
         }
     }
 
-    // ── 汇总发送 Telegram 消息 ───────
+    // ── 统一发送 Telegram 汇总消息 ───────
     await sendSummaryTG(summaryResults);
 });
