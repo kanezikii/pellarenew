@@ -53,37 +53,65 @@ function parseCookies(cookieStr) {
     }).filter(Boolean);
 }
 
-// ── 精准从 UI 提取 EXPIRY 倒计时字符串 (如 1D 6H 32M) ────────
+// ── 精准从 UI 提取 EXPIRY 倒计时字符串 (大幅增强版) ────────
 async function fetchExpiryTimeFromUI(page, serverId) {
     try {
+        // 优先使用 /overview 路径（手动截图确认这是完整面板）
         const targetUrl = serverId
-            ? `https://www.pella.app/server/${serverId}`
+            ? `https://www.pella.app/server/${serverId}/overview`
             : 'https://www.pella.app/home';
 
         console.log(`🔍 打开页面读取 EXPIRY 时间: ${targetUrl}`);
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
-        await sleep(5000); // 增加等待，确保动态内容加载
+        await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 45000 }).catch(() => {
+            console.log('⚠️ networkidle 超时，继续尝试...');
+        });
+        await sleep(6000);
+
+        // 滚动到底部，触发懒加载
+        await page.evaluate(() => {
+            window.scrollTo(0, document.body.scrollHeight);
+            window.scrollTo(0, 0);
+        });
+        await sleep(2000);
+
+        // 主动等待 expires 文字出现（最多再等 20 秒）
+        try {
+            await page.waitForFunction(() => {
+                const t = (document.body.innerText || '').toLowerCase();
+                return t.includes('expires') || t.includes('expiry') || /\d+\s*[dh]\s*\d+\s*[hm]/.test(t);
+            }, { timeout: 20000 });
+            console.log('✅ 检测到 expires 相关文本');
+        } catch (e) {
+            console.log('⚠️ 等待 expires 文本超时，继续尝试提取...');
+        }
+
+        await sleep(2000);
 
         const result = await page.evaluate(() => {
             const bodyText = (document.body.innerText || '').replace(/\s+/g, ' ').trim();
 
-            // 主匹配：Your server expires in 1D 6H 32M
+            // 主匹配（与手动截图完全一致）
             let match = bodyText.match(/Your server expires in\s*([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/i);
-            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 400) };
+            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 800) };
 
-            // 备用1：expires in 1D 6H 32M
+            // 备用宽松匹配
             match = bodyText.match(/expires?\s+in\s*([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/i);
-            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 400) };
+            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 800) };
 
-            // 备用2：更宽松，任意 D H M 组合
-            match = bodyText.match(/([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/i);
-            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 400) };
+            match = bodyText.match(/([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/);
+            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 800) };
 
-            // 备用3：Expires: 1D 6H 32M 或类似
-            match = bodyText.match(/(?:Expires?|Expiry|剩余|倒计时)[:\s]*([0-9]+\s*[DdHhMm\s]+)/i);
-            if (match) return { expiry: match[1].replace(/\s+/g, ' ').trim(), snippet: bodyText.substring(0, 400) };
+            // 遍历所有元素，找包含 expires 的节点
+            const all = document.querySelectorAll('div, p, span, section');
+            for (const el of all) {
+                const txt = (el.innerText || '').trim();
+                if (txt.toLowerCase().includes('expires in') && txt.length < 120) {
+                    const m = txt.match(/([0-9]+\s*[Dd]\s*[0-9]+\s*[Hh]\s*[0-9]+\s*[Mm])/i);
+                    if (m) return { expiry: m[1].replace(/\s+/g, ' ').trim(), snippet: txt };
+                }
+            }
 
-            return { expiry: null, snippet: bodyText.substring(0, 500) };
+            return { expiry: null, snippet: bodyText.substring(0, 800) };
         });
 
         if (result.expiry) {
@@ -425,7 +453,7 @@ async function handleFitnesstipz(page) {
 }
 
 // ── 主测试 ──────────────────────────────────────────────────
-test('Pella 多账号自动续期（DOM抓取按钮+精准离散时间版）', async () => {
+test('Pella 多账号自动续期（支持内部Claiming + 外部广告 + 强力EXPIRY）', async () => {
     if (accounts.length === 0) {
         throw new Error('❌ 未找到任何账号配置，请检查 PELLA_ACCOUNTS');
     }
@@ -551,10 +579,10 @@ test('Pella 多账号自动续期（DOM抓取按钮+精准离散时间版）', a
                     if (item.link) apiLinks.push(item.link);
                 }
             }
-            // 2. 直接从 UI 网页抓取可点击的 Claim 16 Hours 按钮链接
-            const targetServerUrl = serverId ? `https://www.pella.app/server/${serverId}` : 'https://www.pella.app/home';
+            // 2. 从 UI 抓取 Claim 按钮
+            const targetServerUrl = serverId ? `https://www.pella.app/server/${serverId}/overview` : 'https://www.pella.app/home';
             await page.goto(targetServerUrl, { waitUntil: 'domcontentloaded' });
-            await sleep(3000);
+            await sleep(4000);
             const uiLinks = await page.evaluate(() => {
                 const found = [];
                 document.querySelectorAll('a').forEach(a => {
@@ -565,7 +593,6 @@ test('Pella 多账号自动续期（DOM抓取按钮+精准离散时间版）', a
                 });
                 return found;
             });
-            // 合并并去重
             const allUnclaimedLinks = Array.from(new Set([...uiLinks, ...apiLinks]));
             if (allUnclaimedLinks.length === 0) {
                 const expiryTime = await fetchExpiryTimeFromUI(page, serverId);
@@ -584,153 +611,159 @@ test('Pella 多账号自动续期（DOM抓取按钮+精准离散时间版）', a
             for (let i = 0; i < allUnclaimedLinks.length; i++) {
                 const renewLink = allUnclaimedLinks[i];
                 console.log(`\n🌐 [${i + 1}/${allUnclaimedLinks.length}] 处理链接: ${renewLink}`);
-                let adDomainVisited = false; // 关键标志：是否真正经过广告中转
 
                 await page.goto(renewLink, { waitUntil: 'domcontentloaded' });
-                await sleep(2000);
+                await sleep(4000);
 
-                // 等待跳转至广告短链页（增强版）
-                console.log('⏳ 等待跳转至广告/中转域名...');
-                for (let waitSec = 0; waitSec < 25; waitSec++) { // 延长到 25 秒
-                    const curUrl = page.url();
-                    if (
-                        curUrl.includes('tpi.li') ||
-                        curUrl.includes('fitnesstipz.com') ||
-                        curUrl.includes('madurird.com') ||
-                        curUrl.includes('crn77.com') ||
-                        (!curUrl.includes('pella.app') && !curUrl.includes('about:blank'))
-                    ) {
-                        console.log(`✅ 已成功跳转至短链/广告页: ${curUrl}`);
-                        adDomainVisited = true;
-                        break;
+                // 检查当前页面状态
+                const initialText = await page.evaluate(() => (document.body.innerText || '').substring(0, 300));
+                console.log(`📄 当前页面文本片段: ${initialText.replace(/\n/g, ' ')}`);
+
+                let claimSuccess = false;
+
+                // ========== 模式1：内部 Claiming... 流程 ==========
+                if (initialText.includes('Claiming') || page.url().includes('/renew/')) {
+                    console.log('🔄 检测到内部 Claiming... 流程，开始耐心等待完成（最多90秒）...');
+                    await page.screenshot({ path: `claiming_start_${email.replace(/[^a-z0-9]/gi, '_')}_${i}.png` }).catch(() => {});
+
+                    for (let t = 0; t < 90; t++) {
+                        await sleep(1000);
+                        const curUrl = page.url();
+                        const text = await page.evaluate(() => (document.body.innerText || '').substring(0, 400));
+
+                        // 成功标志：不再显示 Claiming，或跳转到 server/home，或出现 expires / Claimed
+                        const noLongerClaiming = !text.includes('Claiming');
+                        const backToServer = curUrl.includes('/server/') || curUrl.includes('/home') || curUrl.includes('/overview');
+                        const hasSuccessHint = text.toLowerCase().includes('expires') || text.includes('Claimed') || text.includes('success');
+
+                        if ((noLongerClaiming && (backToServer || hasSuccessHint)) || (backToServer && hasSuccessHint)) {
+                            console.log(`🎉 内部 Claiming 流程成功完成！用时约 ${t + 1} 秒，当前URL: ${curUrl}`);
+                            claimSuccess = true;
+                            successCount++;
+                            break;
+                        }
+
+                        // 每 8 秒尝试点击可能的按钮
+                        if (t > 0 && t % 8 === 0) {
+                            await page.evaluate(() => {
+                                document.querySelectorAll('button, a, [role="button"], .btn').forEach(el => {
+                                    const t = (el.innerText || el.textContent || '').toLowerCase();
+                                    if (t.includes('continue') || t.includes('claim') || t.includes('get') || t.includes('confirm')) {
+                                        try { el.click(); } catch (e) {}
+                                    }
+                                });
+                            }).catch(() => {});
+                        }
                     }
-                    // 强行触发页面上的各种可能按钮/链接
-                    await page.evaluate(() => {
-                        // 优先点击明显的 Claim / Continue / Get Link
-                        const candidates = [
-                            ...document.querySelectorAll('a, button, [role="button"], .btn, #continue, #getnewlink, p.getmylink, span.wp2continuelink')
-                        ];
-                        for (const el of candidates) {
-                            const txt = (el.innerText || el.textContent || '').toLowerCase();
-                            const href = el.href || '';
-                            if (
-                                txt.includes('claim') ||
-                                txt.includes('continue') ||
-                                txt.includes('get link') ||
-                                txt.includes('16 hour') ||
-                                href.includes('tpi.li') ||
-                                href.includes('fitnesstipz') ||
-                                href.includes('madurird') ||
-                                href.includes('crn77')
-                            ) {
-                                try { el.click(); } catch (e) {}
+
+                    if (!claimSuccess) {
+                        console.log('⚠️ 内部 Claiming 流程超时（90秒）');
+                        await page.screenshot({ path: `claiming_timeout_${email.replace(/[^a-z0-9]/gi, '_')}_${i}.png` }).catch(() => {});
+                    }
+                }
+                // ========== 模式2：外部广告短链流程（兼容旧逻辑） ==========
+                else {
+                    console.log('⏳ 未检测到 Claiming，尝试外部广告跳转流程...');
+                    let adDomainVisited = false;
+
+                    for (let waitSec = 0; waitSec < 25; waitSec++) {
+                        const curUrl = page.url();
+                        if (
+                            curUrl.includes('tpi.li') ||
+                            curUrl.includes('fitnesstipz.com') ||
+                            curUrl.includes('madurird.com') ||
+                            curUrl.includes('crn77.com') ||
+                            (!curUrl.includes('pella.app') && !curUrl.includes('about:blank'))
+                        ) {
+                            console.log(`✅ 已跳转至外部短链/广告页: ${curUrl}`);
+                            adDomainVisited = true;
+                            break;
+                        }
+                        await page.evaluate(() => {
+                            const candidates = [...document.querySelectorAll('a, button, [role="button"], .btn')];
+                            for (const el of candidates) {
+                                const txt = (el.innerText || '').toLowerCase();
+                                const href = el.href || '';
+                                if (txt.includes('claim') || txt.includes('continue') || txt.includes('get link') ||
+                                    href.includes('tpi.li') || href.includes('fitnesstipz')) {
+                                    try { el.click(); } catch (e) {}
+                                }
+                            }
+                        }).catch(() => {});
+                        await sleep(1000);
+                    }
+
+                    if (adDomainVisited) {
+                        // 处理 CF / fitnesstipz / tpi.li（原有逻辑）
+                        const hasTurnstile = await page.evaluate('!!document.querySelector("input[name=\'cf-turnstile-response\']")');
+                        if (hasTurnstile) {
+                            console.log('🛡️ 检测到 CF Turnstile...');
+                            const cfOk = await solveTurnstile(page);
+                            if (!cfOk) {
+                                console.log(`❌ CF 验证失败`);
+                                continue;
                             }
                         }
-                        // 兜底：点击任意 a.btn 或 button
-                        const btn = document.querySelector('a.btn, button, a[href*="tpi.li"], a[href*="fitnesstipz"]');
-                        if (btn) try { btn.click(); } catch (e) {}
-                    }).catch(() => {});
-                    await sleep(1000);
-                }
 
-                if (!adDomainVisited) {
-                    console.log('⚠️ 未能跳转到广告中转页，当前仍停留在 pella 域名。尝试额外截图并标记此链接失败。');
-                    await page.screenshot({ path: `no_ad_redirect_${email}_${i}.png` }).catch(() => {});
-                    // 不计入成功，继续下一个链接
-                    continue;
-                }
+                        if (page.url().includes('tpi.li') || page.url().includes('fitnesstipz')) {
+                            try {
+                                await page.waitForSelector('#continue', { timeout: 8000 });
+                                await page.click('#continue');
+                                await sleep(3000);
+                            } catch (e) {}
+                        }
 
-                // 处理 CF Turnstile
-                const hasTurnstile = await page.evaluate('!!document.querySelector("input[name=\'cf-turnstile-response\']")');
-                if (hasTurnstile) {
-                    console.log('🛡️ 检测到 CF Turnstile，开始处理...');
-                    const cfOk = await solveTurnstile(page);
-                    if (!cfOk) {
-                        console.log(`❌ 第 ${i + 1} 个链接 CF 验证失败`);
-                        continue;
+                        let loopCount = 0;
+                        while (page.url().includes('fitnesstipz.com') && loopCount < 5) {
+                            loopCount++;
+                            const ok = await handleFitnesstipz(page);
+                            if (!ok) break;
+                            await sleep(3000);
+                        }
+
+                        if (page.url().includes('tpi.li')) {
+                            for (let k = 0; k < 60; k++) {
+                                await sleep(1000);
+                                const timerText = await page.evaluate(`(() => {
+                                    const el = document.querySelector('#timer');
+                                    return el ? el.textContent.trim() : '0';
+                                })()`);
+                                if ((parseInt(timerText) || 0) <= 0) break;
+                            }
+                            try {
+                                await page.click('a.btn.btn-success.btn-lg.get-link');
+                                await sleep(3000);
+                            } catch (e) {}
+                        }
+
+                        // 等待返回 pella
+                        for (let waitSec = 0; waitSec < 20; waitSec++) {
+                            await sleep(1000);
+                            const curUrl = page.url();
+                            if (curUrl.includes('pella.app') && !curUrl.includes('tpi.li') && !curUrl.includes('fitnesstipz')) {
+                                console.log(`🎉 外部广告流程续期成功！`);
+                                claimSuccess = true;
+                                successCount++;
+                                break;
+                            }
+                        }
+                    } else {
+                        console.log('⚠️ 既没有 Claiming 也没有跳转外部广告，标记失败');
+                        await page.screenshot({ path: `no_claim_no_ad_${email.replace(/[^a-z0-9]/gi, '_')}_${i}.png` }).catch(() => {});
                     }
                 }
 
-                // 点击 #continue
-                if (page.url().includes('tpi.li') || page.url().includes('fitnesstipz')) {
-                    console.log('📤 点击 Continue...');
-                    try {
-                        await page.waitForSelector('#continue', { timeout: 10000 });
-                        await page.click('#continue');
-                        await sleep(3000);
-                    } catch (e) {
-                        console.log(`⚠️ #continue 未找到：${e.message}`);
-                    }
-                }
-
-                // 处理多重 fitnesstipz 中转页
-                let loopCount = 0;
-                while (page.url().includes('fitnesstipz.com') && loopCount < 5) {
-                    loopCount++;
-                    console.log(`🔄 处理第 ${loopCount} 个 fitnesstipz 中转页...`);
-                    const ok = await handleFitnesstipz(page);
-                    if (!ok) {
-                        console.log(`❌ 第 ${i + 1} 个链接中转页处理失败`);
-                        break;
-                    }
-                    await sleep(3000);
-                }
-
-                // 处理 tpi.li 倒计时与 Get Link
-                if (page.url().includes('tpi.li')) {
-                    console.log('⏳ 等待 tpi.li 倒计时...');
-                    for (let k = 0; k < 60; k++) {
-                        await sleep(1000);
-                        const timerText = await page.evaluate(`
-                            (function(){
-                                var el = document.querySelector('#timer');
-                                return el ? el.textContent.trim() : '0';
-                            })()
-                        `);
-                        if ((parseInt(timerText) || 0) <= 0) break;
-                    }
-                    console.log('🔍 获取 renew 链接...');
-                    const renewHref = await page.evaluate(`
-                        (function(){
-                            var a = document.querySelector('a.btn.btn-success.btn-lg.get-link');
-                            return a ? a.href : null;
-                        })()
-                    `);
-                    if (!renewHref || !renewHref.includes('/renew/')) {
-                        await page.screenshot({ path: `no_renew_href_${email}_${i}.png` });
-                        console.log(`❌ 第 ${i + 1} 个链接未找到有效 renew 地址`);
-                        continue;
-                    }
-                    console.log(`✅ 找到 renew 链接: ${renewHref}`);
-                    await page.click('a.btn.btn-success.btn-lg.get-link');
-                    await sleep(3000);
-                }
-
-                // 等待重定向回 Pella（只有真正经过广告才算成功）
-                console.log('⏳ 等待完成重定向...');
-                let redirectedBack = false;
-                for (let waitSec = 0; waitSec < 25; waitSec++) {
-                    await sleep(1000);
-                    const curUrl = page.url();
-                    if (curUrl.includes('pella.app') && !curUrl.includes('tpi.li') && !curUrl.includes('fitnesstipz') && !curUrl.includes('madurird') && !curUrl.includes('crn77')) {
-                        console.log(`🎉 第 ${i + 1} 个链接续期成功！（已确认经过广告中转）`);
-                        successCount++;
-                        redirectedBack = true;
-                        break;
-                    }
-                }
-                if (!redirectedBack) {
-                    console.log(`⚠️ 第 ${i + 1} 个链接未成功返回 pella.app`);
-                    await page.screenshot({ path: `redirect_fail_${email}_${i}.png` }).catch(() => {});
+                if (!claimSuccess) {
+                    console.log(`❌ 第 ${i + 1} 个链接最终未成功认领`);
                 }
             }
 
-            // 重新进入详情页读取最新的 EXPIRY 时间
+            // 最终读取 EXPIRY
             const latestExpiryTime = await fetchExpiryTimeFromUI(page, serverId);
             await page.screenshot({ path: `final_result_${email.replace(/[^a-z0-9]/gi, '_')}.png` });
             summaryResults.push({
                 email,
-                status: `✅ 续期成功！(完成 ${successCount}/${allUnclaimedLinks.length} 个链接)`,
+                status: `✅ 续期完成 (成功 ${successCount}/${allUnclaimedLinks.length} 个链接)`,
                 expiry: latestExpiryTime
             });
         } catch (e) {
@@ -745,6 +778,5 @@ test('Pella 多账号自动续期（DOM抓取按钮+精准离散时间版）', a
             await browser.close();
         }
     }
-    // ── 统一发送 Telegram 汇总消息 ───────
     await sendSummaryTG(summaryResults);
 });
