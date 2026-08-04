@@ -4,6 +4,10 @@ on:
     - cron: '0 1 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: write # 用于清理工作流历史记录
+
 jobs:
   renew:
     name: 🔄 执行续期
@@ -46,12 +50,26 @@ jobs:
 
       - name: 🚀 运行续期脚本
         env:
-          PELLA_ACCOUNTS: ${{ secrets.PELLA_ACCOUNTS }} # 👈 这里修改为复数 PELLA_ACCOUNTS
+          PELLA_ACCOUNTS: ${{ secrets.PELLA_ACCOUNTS }}
           TG_BOT:        ${{ secrets.TG_BOT }}
           GOST_PROXY:    http://127.0.0.1:8080
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
             npx playwright test tests/pella_renew.spec.js
+
+      - name: 🔄 自动覆盖更新 Secrets (PELLA_ACCOUNTS)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }} # 👈 已经直接调用你现有的 GH_PAT
+        run: |
+          if [ -f "updated_accounts.txt" ]; then
+            NEW_ACCOUNTS=$(cat updated_accounts.txt)
+            if [ -n "$NEW_ACCOUNTS" ]; then
+              echo "🔄 检测到 Cookie 已刷新，正在覆写 GitHub Secrets (PELLA_ACCOUNTS)..."
+              gh secret set PELLA_ACCOUNTS -b "$NEW_ACCOUNTS" --repo ${{ github.repository }}
+              echo "✅ Secrets (PELLA_ACCOUNTS) 已成功覆盖更新！"
+            fi
+          fi
 
       - name: 📸 上传截图
         if: always()
@@ -60,3 +78,12 @@ jobs:
           name: debug-screenshots
           path: "*.png"
           retention-days: 7
+
+      - name: 🧹 自动清理历史工作流记录
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 3 # 保留最近 3 次运行记录，清理其余旧记录
