@@ -3,17 +3,37 @@ const { test, chromium } = require('@playwright/test');
 const https = require('https');
 const http = require('http');
 const { execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 // ── 账号配置 ────────────────────────────────────────────────
-const accountsStr = process.env.PELLA_ACCOUNTS || '';
-const accounts = accountsStr.split('|').filter(Boolean).map(acc => {
+const rawAccountsStr = process.env.PELLA_ACCOUNTS || '';
+const accountsMap = new Map();
+
+rawAccountsStr.split('|').filter(Boolean).forEach(acc => {
     const idx = acc.indexOf(',');
-    if (idx === -1) return [acc.trim(), ''];
-    return [acc.substring(0, idx).trim(), acc.substring(idx + 1).trim()];
+    if (idx !== -1) {
+        const email = acc.substring(0, idx).trim();
+        const secret = acc.substring(idx + 1).trim();
+        accountsMap.set(email, secret);
+    }
 });
 
+const accounts = Array.from(accountsMap.entries());
 const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
 const TIMEOUT = 120000;
+
+// ── 写回最新 Secrets 到文件的辅助函数 ───────────────────────
+function updateSavedAccountSecret(email, newSecret) {
+    accountsMap.set(email, newSecret);
+    const updatedList = [];
+    for (const [accEmail, accSecret] of accountsMap.entries()) {
+        updatedList.push(`${accEmail},${accSecret}`);
+    }
+    const finalStr = updatedList.join('|');
+    fs.writeFileSync(path.join(process.cwd(), 'updated_accounts.txt'), finalStr, 'utf-8');
+    console.log(`💾 已将 ${email} 的最新 Cookie 写入本地更新队列`);
+}
 
 // ── Cookie 解析工具函数 ──────────────────────────────────────
 function parseCookies(cookieStr) {
@@ -29,6 +49,8 @@ function parseCookies(cookieStr) {
             value,
             domain: '.pella.app',
             path: '/',
+            secure: true,
+            sameSite: 'Lax',
         };
     }).filter(Boolean);
 }
@@ -428,8 +450,15 @@ for (const [email, secretVal] of accounts) {
                 await page.goto('https://www.pella.app/home', { waitUntil: 'domcontentloaded' });
                 await sleep(3000);
 
-                if (page.url().includes('/login')) {
-                    throw new Error('❌ Cookie 已失效或不完整，被重定向到了登录页！请重新抓取 Cookie。');
+                let hasSession = false;
+                for (let i = 0; i < 10; i++) {
+                    hasSession = await page.evaluate('!!(window.Clerk && window.Clerk.session)');
+                    if (hasSession) break;
+                    await sleep(500);
+                }
+
+                if (!hasSession) {
+                    throw new Error('❌ Cookie 注入后未能生成有效 Session！请重新抓取并更新 Cookie。');
                 }
                 console.log(`✅ Cookie 免密登录成功！当前页面：${page.url()}`);
             } else {
@@ -463,9 +492,20 @@ for (const [email, secretVal] of accounts) {
                 await sleep(500);
             }
 
+            // ── 抓取最新 Cookie 并写入更新文件 ────────────────────────
+            try {
+                const latestCookies = await context.cookies(['https://www.pella.app', 'https://clerk.pella.app']);
+                const cookieStr = latestCookies.map(c => `${c.name}=${c.value}`).join('; ');
+                if (cookieStr.includes('__client') && cookieStr.includes('__session')) {
+                    updateSavedAccountSecret(email, `cookie:${cookieStr}`);
+                }
+            } catch (err) {
+                console.log(`⚠️ 抓取最新 Cookie 失败，跳过更新: ${err.message}`);
+            }
+
             console.log('🔑 获取 JWT token...');
-            const token = await page.evaluate('window.Clerk.session.getToken()');
-            if (!token) throw new Error('❌ 无法获取 Clerk token');
+            const token = await page.evaluate('window.Clerk && window.Clerk.session ? window.Clerk.session.getToken() : null');
+            if (!token) throw new Error('❌ 无法获取 Clerk token（Session 不可用）');
             console.log('✅ Token 获取成功');
 
             console.log('🔍 获取服务器续期链接...');
