@@ -118,35 +118,33 @@ function sendSummaryTG(results) {
 }
 
 // ── 智能判断是否需要重启 ────────────────────────────────────
-async function needRestart(page, token, serverId, apiStatus) {
+async function needRestart(page, serverId, apiStatus) {
     const status = (apiStatus || '').toLowerCase();
     
-    // 1. API 状态明确不正常 → 重启
     if (status && status !== 'running' && status !== 'online') {
         console.log(`⚠️ API 状态为 "${apiStatus}"，需要重启`);
         return true;
     }
 
     try {
-        const overviewUrl = `https://www.pella.app/server/${serverId}/overview`;
-        console.log(`🔍 检查 CONSOLE: ${overviewUrl}`);
-        await page.goto(overviewUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        // 去掉 /overview
+        const targetUrl = `https://www.pella.app/server/${serverId}`;
+        console.log(`🔍 检查页面: ${targetUrl}`);
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
         
-        // 先等页面基础加载
         await sleep(5000);
-        console.log('⏳ 额外等待 5 秒，确保页面完整加载...');
-        await sleep(5000);  // 再等 5 秒
+        console.log('⏳ 额外等待 5 秒，确保页面加载完成...');
+        await sleep(5000);
 
-        // 检查页面是否显示 PENDING 或 START 按钮
         const pageInfo = await page.evaluate(() => {
             const bodyText = (document.body.innerText || '').toLowerCase();
             
             const hasPending = bodyText.includes('pending');
-            
             const hasStartBtn = Array.from(document.querySelectorAll('button')).some(btn => 
                 (btn.innerText || '').trim().toUpperCase() === 'START'
             );
 
+            // 提取 CONSOLE 内容
             let consoleText = '';
             const selectors = [
                 'pre.relative.h-full.overflow-auto',
@@ -158,60 +156,70 @@ async function needRestart(page, token, serverId, apiStatus) {
                 const el = document.querySelector(sel);
                 if (el) {
                     const t = (el.innerText || el.textContent || '').trim();
-                    if (t.length > 10) {
+                    if (t.length > 5) {
                         consoleText = t;
                         break;
                     }
                 }
             }
 
-            return { hasPending, hasStartBtn, consoleText };
+            return { hasPending, hasStartBtn, consoleText, bodyText };
         });
 
         const text = (pageInfo.consoleText || '').toLowerCase();
-        const preview = text.substring(0, 180).replace(/\n/g, ' ');
+        const preview = text.substring(0, 200).replace(/\n/g, ' ');
         console.log(`CONSOLE 预览: ${preview || '(空)'}...`);
-        console.log(`页面状态检测 → PENDING: ${pageInfo.hasPending}, START按钮: ${pageInfo.hasStartBtn}`);
+        console.log(`页面检测 → PENDING: ${pageInfo.hasPending}, START按钮: ${pageInfo.hasStartBtn}`);
 
-        // 健康特征
-        const healthySignals = [
-            'is running', 'php is running', 'web is running', 'bot is running',
-            'argo_domain', 'empowerment', 'private key', 'komari',
-            'get ipv4', 'websocket', 'download'
+        // 健康关键词（非 start 的正常运行日志）
+        const healthyKeywords = [
+            'is running',
+            'php is running',
+            'web is running',
+            'bot is running',
+            'app is running',
+            'argo_domain',
+            'empowerment',
+            'private key',
+            'public key',
+            'komari',
+            'get ipv4',
+            'websocket',
+            'download',
+            'failed to connect',
+            'retrying'
         ];
-        const hasHealthy = healthySignals.some(sig => text.includes(sig));
 
-        if (hasHealthy) {
-            console.log('✅ 检测到正常运行日志，无需重启');
+        const hasNonStartLog = healthyKeywords.some(k => text.includes(k));
+
+        // 有非 start 的正常日志 → 不重启
+        if (hasNonStartLog) {
+            console.log('✅ CONSOLE 存在非 start 的正常日志，无需重启');
             return false;
         }
 
-        // 页面显示 PENDING 或有 START 按钮 → 需要重启
+        // 页面显示 PENDING 或 START 按钮 → 重启
         if (pageInfo.hasPending || pageInfo.hasStartBtn) {
-            console.log('⚠️ 页面显示 PENDING 或存在 START 按钮，需要重启');
+            console.log('⚠️ 页面显示 PENDING 或 START 按钮，需要重启');
             return true;
         }
 
-        // 明确只有 starting
-        if (text.includes('starting') && text.length < 120 && !hasHealthy) {
-            console.log('⚠️ 明确只有 starting，需要重启');
+        // CONSOLE 为空或只有 start 相关
+        if (!text || text.length < 15) {
+            console.log('⚠️ CONSOLE 为空，需要重启');
             return true;
         }
 
-        // CONSOLE 为空
-        if (!text || text.length < 20) {
-            console.log('⚠️ CONSOLE 为空且无健康日志，需要重启');
-            try {
-                await page.screenshot({ path: `console_empty_${serverId.slice(-6)}_${Date.now()}.png`, fullPage: false });
-            } catch (e) {}
+        if (text.includes('start') && !hasNonStartLog) {
+            console.log('⚠️ CONSOLE 只有 start 相关内容，需要重启');
             return true;
         }
 
-        console.log('ℹ️ 未匹配到明确需要重启的特征，跳过重启');
+        console.log('ℹ️ 默认不重启');
         return false;
 
     } catch (e) {
-        console.log(`检查 CONSOLE 失败: ${e.message}，默认不重启`);
+        console.log(`检查失败: ${e.message}，默认不重启`);
         return false;
     }
 }
@@ -248,7 +256,7 @@ async function doRestart(page, token, serverId) {
 
 // ── 主测试 ──────────────────────────────────────────────────
 test('Pella 多账号自动续期 + 智能重启', async () => {
-    test.setTimeout(240000);
+    test.setTimeout(300000);
 
     if (accounts.length === 0) {
         throw new Error('❌ 未找到任何账号配置，请检查 PELLA_ACCOUNTS');
@@ -350,7 +358,9 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 const serverId = server.id || server._id;
                 console.log(`\n处理服务器 ${serverId} (API状态: ${server.status || '未知'})`);
 
-                // 续期
+                // ========== 续期 + 重启判断同步进行 ==========
+                
+                // 1. 先刷新链接
                 console.log(`调用 renew/update 刷新广告链接...`);
                 try {
                     await page.evaluate(async ({ t, sid }) => {
@@ -370,6 +380,7 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 }
                 await sleep(800);
 
+                // 2. 获取续期链接
                 let renewLinks = [];
                 try {
                     const detail = await page.evaluate(async ({ t, sid }) => {
@@ -396,6 +407,7 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 let claimedCount = 0;
                 const failMessages = [];
 
+                // 3. 执行续期
                 for (let i = 0; i < linksToTry.length; i++) {
                     const linkObj = linksToTry[i];
                     const linkUrl = typeof linkObj === 'string' ? linkObj : (linkObj.link || '');
@@ -452,8 +464,9 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                     renewResults.push({ serverId, status: 'no_links', message: renewMsg });
                 }
 
-                // 智能重启
-                const shouldRestart = await needRestart(page, token, serverId, server.status);
+                // 4. 同步进行重启判断
+                console.log('🔄 同步进行重启判断...');
+                const shouldRestart = await needRestart(page, serverId, server.status);
                 let restartMsg = '无需重启';
 
                 if (shouldRestart) {
