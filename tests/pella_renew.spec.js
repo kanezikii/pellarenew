@@ -117,7 +117,7 @@ function sendSummaryTG(results) {
     });
 }
 
-// ── 智能判断是否需要重启 ────────────────────────────────────
+// ── 智能判断是否需要重启（精确抓取 pre.bg-black） ───────────
 async function needRestart(page, token, serverId, apiStatus) {
     const status = (apiStatus || '').toLowerCase();
     if (status && status !== 'running' && status !== 'online') {
@@ -128,81 +128,59 @@ async function needRestart(page, token, serverId, apiStatus) {
     try {
         const overviewUrl = `https://www.pella.app/server/${serverId}/overview`;
         console.log(`🔍 检查 CONSOLE: ${overviewUrl}`);
-        await page.goto(overviewUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await sleep(5000);
+        await page.goto(overviewUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        await sleep(6000);
 
+        // 精确提取 CONSOLE 日志（根据 DOM 结构）
         const consoleText = await page.evaluate(() => {
-            // 1. 通过 Copy 按钮定位真正的日志区域
-            const copyButtons = Array.from(document.querySelectorAll('button, div, span')).filter(el =>
-                (el.innerText || '').trim().toLowerCase() === 'copy'
-            );
+            // 优先匹配你截图里的 pre 元素
+            const selectors = [
+                'pre.relative.h-full.overflow-auto',
+                'pre.bg-black',
+                'pre.relative.h-full',
+                'pre'
+            ];
 
-            for (const btn of copyButtons) {
-                let parent = btn.parentElement;
-                for (let i = 0; i < 6 && parent; i++) {
-                    const t = (parent.innerText || '').trim();
-                    if (t.length > 80 && (
-                        t.includes('is running') ||
-                        t.includes('Komari') ||
-                        t.includes('ARGO_DOMAIN') ||
-                        t.includes('Download') ||
-                        t.includes('Empowerment') ||
-                        t.includes('WebSocket') ||
-                        t.includes('starting') ||
-                        t.includes('Private Key')
-                    )) {
-                        return t;
-                    }
-                    parent = parent.parentElement;
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) {
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (t.length > 20) return t;
                 }
             }
 
-            // 2. 找 pre 标签
-            const pres = document.querySelectorAll('pre');
-            for (const pre of pres) {
+            // 备用：找包含 CONSOLE 文字后面的 pre
+            const allPre = document.querySelectorAll('pre');
+            for (const pre of allPre) {
                 const t = (pre.innerText || '').trim();
-                if (t.length > 50) return t;
+                if (t.length > 30) return t;
             }
 
-            // 3. 评分找最像日志的内容
-            let best = '';
-            const all = document.querySelectorAll('div, pre, section, code');
-            for (const el of all) {
-                const t = (el.innerText || '').trim();
-                if (t.length < 60) continue;
-
-                // 排除导航
-                if (t.includes('Overview') && t.includes('Manage') && t.includes('Files')) continue;
-                if (t.includes('pending start restart')) continue;
-                if (t.includes('join our discord')) continue;
-                if (t.includes('TIRED OF RENEWALS')) continue;
-
-                const score =
-                    (t.includes('is running') ? 10 : 0) +
-                    (t.includes('ARGO_DOMAIN') ? 10 : 0) +
-                    (t.includes('Komari') ? 10 : 0) +
-                    (t.includes('Empowerment') ? 8 : 0) +
-                    (t.includes('Download') ? 5 : 0) +
-                    (t.includes('WebSocket') ? 5 : 0) +
-                    (t.includes('starting') ? 3 : 0) +
-                    (t.includes('Private Key') ? 5 : 0);
-
-                if (score > 0 && t.length > best.length) {
-                    best = t;
-                }
-            }
-            return best;
+            return '';
         }).catch(() => '');
 
         const text = (consoleText || '').toLowerCase();
-        const preview = text.substring(0, 200).replace(/\n/g, ' ');
+        const preview = text.substring(0, 250).replace(/\n/g, ' ');
         console.log(`CONSOLE 预览: ${preview || '(完全为空)'}...`);
 
-        // 健康特征
+        // ========== 健康特征 ==========
         const healthySignals = [
-            'is running', 'php is running', 'web is running', 'bot is running', 'app is running',
-            'argo_domain', 'empowerment success', 'private key', 'public key',
-            'komari', 'get ipv4 success', 'websocket', 'failed to connect to websocket', 'download'
+            'is running',
+            'php is running',
+            'web is running',
+            'bot is running',
+            'app is running',
+            'argo_domain',
+            'empowerment success',
+            'private key',
+            'public key',
+            'komari',
+            'get ipv4 success',
+            'websocket',
+            'failed to connect to websocket',
+            'download',
+            'empowerment',
+            'argo_auth'
         ];
 
         const hasHealthy = healthySignals.some(sig => text.includes(sig));
@@ -212,17 +190,19 @@ async function needRestart(page, token, serverId, apiStatus) {
             return false;
         }
 
-        if (text.trim().length < 50) {
+        // 内容过少 → 重启
+        if (text.trim().length < 40) {
             console.log('⚠️ CONSOLE 内容为空或过短，需要重启');
             return true;
         }
 
+        // 只有 starting
         if ((text.includes('starting') || text.includes('正在启动')) && !hasHealthy) {
             console.log('⚠️ CONSOLE 只有 starting，需要重启');
             return true;
         }
 
-        console.log('ℹ️ 未匹配到明确健康特征，默认不重启');
+        console.log('ℹ️ 未匹配到明确异常，默认不重启');
         return false;
 
     } catch (e) {
