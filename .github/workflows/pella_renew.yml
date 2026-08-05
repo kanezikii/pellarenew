@@ -48,11 +48,92 @@ jobs:
           echo "✅ GOST 已启动，测试连通性..."
           curl -s -x http://127.0.0.1:8080 https://api.ipify.org
 
+            - name: 📥 下载 Xray
+        run: |
+          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q Xray-linux-64.zip -d xray
+          chmod +x xray/xray
+
+      - name: 📝 生成 Xray 配置
+        env:
+          VMESS_LINK: ${{ secrets.VMESS_LINK }}
+        run: |
+          # 解码 VMess
+          B64=$(echo "$VMESS_LINK" | sed 's/vmess:\/\///')
+          echo "$B64" | base64 -d > vmess.json
+          
+          # 读取字段
+          ADD=$(jq -r '.add' vmess.json)
+          PORT=$(jq -r '.port' vmess.json)
+          UUID=$(jq -r '.id' vmess.json)
+          HOST=$(jq -r '.host' vmess.json)
+          PATH=$(jq -r '.path' vmess.json)
+          SNI=$(jq -r '.sni' vmess.json)
+          FP=$(jq -r '.fp // "chrome"' vmess.json)
+          
+          cat > xray/config.json << EOF
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [
+              {
+                "port": 10808,
+                "listen": "127.0.0.1",
+                "protocol": "socks",
+                "settings": { "udp": true }
+              }
+            ],
+            "outbounds": [
+              {
+                "protocol": "vmess",
+                "settings": {
+                  "vnext": [
+                    {
+                      "address": "$ADD",
+                      "port": $PORT,
+                      "users": [
+                        {
+                          "id": "$UUID",
+                          "alterId": 0,
+                          "security": "auto"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "streamSettings": {
+                  "network": "ws",
+                  "security": "tls",
+                  "tlsSettings": {
+                    "serverName": "$SNI",
+                    "fingerprint": "$FP",
+                    "allowInsecure": false
+                  },
+                  "wsSettings": {
+                    "path": "$PATH",
+                    "headers": {
+                      "Host": "$HOST"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+          echo "✅ Xray 配置已生成"
+
+      - name: 🚀 启动 Xray 代理
+        run: |
+          nohup ./xray/xray -config xray/config.json > xray.log 2>&1 &
+          sleep 3
+          # 测试代理是否通
+          curl -s --socks5 127.0.0.1:10808 https://api.ipify.org || echo "代理测试失败，继续尝试"
+          echo "✅ Xray 已启动 (socks5://127.0.0.1:10808)"
+
       - name: 🚀 运行续期脚本
         env:
           PELLA_ACCOUNTS: ${{ secrets.PELLA_ACCOUNTS }}
-          TG_BOT:        ${{ secrets.TG_BOT }}
-          GOST_PROXY:    http://127.0.0.1:8080
+          TG_BOT: ${{ secrets.TG_BOT }}
+          PROXY_URL: socks5://127.0.0.1:10808
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
             npx playwright test tests/pella_renew.spec.js
