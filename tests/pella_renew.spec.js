@@ -20,7 +20,6 @@ const accounts = Array.from(accountsMap.entries());
 const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
 const TIMEOUT = 60000;
 
-// ── 写回最新 Secrets ────────────────────────────────────────
 function updateSavedAccountSecret(email, newSecret) {
     accountsMap.set(email, newSecret);
     const updatedList = [];
@@ -31,7 +30,6 @@ function updateSavedAccountSecret(email, newSecret) {
     console.log(`💾 已将 ${email} 的最新 Cookie 写入本地更新队列`);
 }
 
-// ── Cookie 解析 ─────────────────────────────────────────────
 function parseCookies(cookieStr) {
     const cleanStr = cookieStr.replace(/^cookie:/i, '').trim();
     return cleanStr.split(';').map(pair => {
@@ -53,7 +51,6 @@ function nowStr() {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── 计算剩余时间 ────────────────────────────────────────────
 function calcRemaining(expiry) {
     if (!expiry) return 'N/A';
     try {
@@ -78,7 +75,6 @@ function calcRemaining(expiry) {
     }
 }
 
-// ── Telegram 通知 ───────────────────────────────────────────
 function sendSummaryTG(results) {
     return new Promise((resolve) => {
         if (!TG_CHAT_ID || !TG_TOKEN) {
@@ -86,7 +82,7 @@ function sendSummaryTG(results) {
             return resolve();
         }
         const lines = [
-            `📋 Pella 自动续期 + 重启报告`,
+            `📋 Pella 自动续期 + 智能重启报告`,
             `🕐 ${nowStr()}`,
             `──────────────────────────`,
         ];
@@ -102,8 +98,7 @@ function sendSummaryTG(results) {
             }
             if (index < results.length - 1) lines.push(`──────────────────────────`);
         });
-        lines.push(``);
-        lines.push(`Pella Auto Renewal`);
+        lines.push(``, `Pella Auto Renewal`);
 
         const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: lines.join('\n') });
         const req = https.request({
@@ -122,9 +117,110 @@ function sendSummaryTG(results) {
     });
 }
 
+// ── 检测是否需要重启 ────────────────────────────────────────
+async function needRestart(page, token, serverId, apiStatus) {
+    // 1. 先根据 API 状态判断
+    const status = (apiStatus || '').toLowerCase();
+    if (status && status !== 'running') {
+        console.log(`⚠️ API 状态为 "${apiStatus}"，需要重启`);
+        return true;
+    }
+
+    // 2. 打开 overview 页面检查 CONSOLE 内容
+    try {
+        const overviewUrl = `https://www.pella.app/server/${serverId}/overview`;
+        console.log(`🔍 检查 CONSOLE: ${overviewUrl}`);
+        await page.goto(overviewUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await sleep(3500);
+
+        const consoleText = await page.evaluate(() => {
+            // 尝试多种方式获取控制台内容
+            const selectors = [
+                '[class*="console"]',
+                '[class*="Console"]',
+                'pre',
+                '.console-output',
+                '#console',
+                '[data-testid="console"]'
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el && el.innerText && el.innerText.trim().length > 5) {
+                    return el.innerText.trim();
+                }
+            }
+            // 兜底：找包含 "CONSOLE" 标题附近的内容
+            const all = document.querySelectorAll('div, pre, section');
+            for (const el of all) {
+                if ((el.innerText || '').includes('CONSOLE') || (el.innerText || '').includes('Web server is running')) {
+                    return el.innerText.trim();
+                }
+            }
+            return document.body.innerText || '';
+        }).catch(() => '');
+
+        const text = (consoleText || '').toLowerCase();
+        console.log(`CONSOLE 内容片段: ${text.substring(0, 120).replace(/\n/g, ' ')}...`);
+
+        // 判断是否异常
+        const isEmpty = text.trim().length < 20;
+        const onlyStarting = (
+            text.includes('starting') ||
+            text.includes('启动') ||
+            text.includes('正在启动') ||
+            text.includes('pending')
+        ) && !text.includes('running') && !text.includes('listening') && !text.includes('web server is running');
+
+        if (isEmpty) {
+            console.log('⚠️ CONSOLE 为空，需要重启');
+            return true;
+        }
+        if (onlyStarting) {
+            console.log('⚠️ CONSOLE 只有启动信息，需要重启');
+            return true;
+        }
+
+        console.log('✅ CONSOLE 正常，无需重启');
+        return false;
+    } catch (e) {
+        console.log(`检查 CONSOLE 失败: ${e.message}，为安全起见执行重启`);
+        return true;
+    }
+}
+
+// ── 执行重启 ────────────────────────────────────────────────
+async function doRestart(page, token, serverId) {
+    try {
+        const result = await page.evaluate(async ({ t, sid }) => {
+            const res = await fetch('https://api.pella.app/server/redeploy', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${t}`,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Origin': 'https://www.pella.app',
+                    'Referer': 'https://www.pella.app/'
+                },
+                body: `id=${encodeURIComponent(sid)}`
+            });
+            const text = await res.text();
+            return { status: res.status, text };
+        }, { t: token, sid: serverId });
+
+        console.log(`重启响应: HTTP ${result.status} ${result.text || '(空)'}`);
+        if (result.status === 200 || !result.text || result.text.trim() === '') {
+            console.log('✅ 重启指令已发送');
+            return true;
+        }
+        return false;
+    } catch (e) {
+        console.log(`重启异常: ${e.message}`);
+        return false;
+    }
+}
+
 // ── 主测试 ──────────────────────────────────────────────────
-test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => {
-    test.setTimeout(180000);
+test('Pella 多账号自动续期 + 智能重启', async () => {
+    test.setTimeout(240000);
 
     if (accounts.length === 0) {
         throw new Error('❌ 未找到任何账号配置，请检查 PELLA_ACCOUNTS');
@@ -164,8 +260,7 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
 
         if (isCookieLogin) {
             console.log('🍪 检测到 Cookie 配置，注入 Cookie 实现免密登录...');
-            const cookies = parseCookies(secretVal);
-            await context.addCookies(cookies);
+            await context.addCookies(parseCookies(secretVal));
         }
 
         const page = await context.newPage();
@@ -173,7 +268,7 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
         let token = null;
 
         try {
-            // 登录拿 Token
+            // 登录
             if (isCookieLogin) {
                 console.log('🔑 打开 Pella 首页 (Cookie 免密模式)...');
                 await page.goto('https://www.pella.app/home', { waitUntil: 'domcontentloaded' });
@@ -187,27 +282,16 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
                 if (!hasSession) throw new Error('Cookie 注入后未能生成有效 Session，请更新 Cookie！');
                 console.log(`✅ Cookie 免密登录成功`);
             } else {
-                console.log('🔑 打开 Pella 登录页 (账号密码模式)...');
-                await page.goto('https://www.pella.app/login', { waitUntil: 'domcontentloaded' });
-                await page.waitForSelector('#identifier-field', { timeout: 15000 });
-                await page.fill('#identifier-field', email);
-                await page.click('span.cl-internal-2iusy0');
-                await sleep(2000);
-                await page.waitForSelector('input[name="password"]', { timeout: 15000 });
-                await page.fill('input[name="password"]', secretVal);
-                await page.click('span.cl-internal-2iusy0');
-                await page.waitForURL(/pella\.app\/(home|dashboard)/, { timeout: 30000 });
-                console.log(`✅ 登录成功`);
+                throw new Error('当前仅支持 Cookie 登录');
             }
 
-            // 等待 Clerk session
+            // 等待 session
             for (let i = 0; i < 20; i++) {
-                const ready = await page.evaluate('!!(window.Clerk && window.Clerk.session)');
-                if (ready) break;
+                if (await page.evaluate('!!(window.Clerk && window.Clerk.session)')) break;
                 await sleep(500);
             }
 
-            // 更新最新 Cookie
+            // 更新 Cookie
             try {
                 const latestCookies = await context.cookies(['https://www.pella.app', 'https://clerk.pella.app']);
                 const cookieStr = latestCookies.map(c => `${c.name}=${c.value}`).join('; ');
@@ -218,12 +302,12 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
                 console.log(`⚠️ 抓取最新 Cookie 失败: ${err.message}`);
             }
 
-            // 获取 JWT
+            // 获取 Token
             console.log('🔑 获取 JWT token...');
             token = await page.evaluate('window.Clerk && window.Clerk.session ? window.Clerk.session.getToken() : null');
             if (!token) throw new Error('无法获取 Clerk token');
 
-            // 获取服务器列表
+            // 获取服务器
             console.log('🔍 获取服务器信息...');
             const serversRes = await page.evaluate(async (t) => {
                 const res = await fetch('https://api.pella.app/user/servers', {
@@ -235,15 +319,15 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
             if (servers.length === 0) throw new Error('未找到服务器');
             console.log(`🖥️ 共 ${servers.length} 台服务器`);
 
-            // ========== 纯 API 续期 + 自动重启 ==========
             const renewResults = [];
             let totalRestartSuccess = 0;
+            let totalRestartSkip = 0;
 
             for (const server of servers) {
                 const serverId = server.id || server._id;
-                console.log(`\n处理服务器 ${serverId} (当前状态: ${server.status || '未知'})`);
+                console.log(`\n处理服务器 ${serverId} (API状态: ${server.status || '未知'})`);
 
-                // 1. 刷新广告链接
+                // ===== 续期 =====
                 console.log(`调用 renew/update 刷新广告链接...`);
                 try {
                     await page.evaluate(async ({ t, sid }) => {
@@ -263,7 +347,6 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
                 }
                 await sleep(800);
 
-                // 2. 获取最新 renew_links
                 let renewLinks = [];
                 try {
                     const detail = await page.evaluate(async ({ t, sid }) => {
@@ -279,7 +362,6 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
                     renewLinks = detail.renew_links || [];
                     console.log(`获取到 ${renewLinks.length} 个续期链接`);
                 } catch (e) {
-                    console.log(`获取详情失败: ${e.message}`);
                     renewLinks = server.renew_links || [];
                 }
 
@@ -291,56 +373,52 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
                 let claimedCount = 0;
                 const failMessages = [];
 
-                if (linksToTry.length > 0) {
-                    for (let i = 0; i < linksToTry.length; i++) {
-                        const linkObj = linksToTry[i];
-                        const linkUrl = typeof linkObj === 'string' ? linkObj : (linkObj.link || '');
-                        const linkId = linkUrl.split('/renew/')[1];
-                        if (!linkId) continue;
+                for (let i = 0; i < linksToTry.length; i++) {
+                    const linkObj = linksToTry[i];
+                    const linkUrl = typeof linkObj === 'string' ? linkObj : (linkObj.link || '');
+                    const linkId = linkUrl.split('/renew/')[1];
+                    if (!linkId) continue;
 
-                        console.log(`尝试链接 ${i + 1}/${linksToTry.length}: ${linkId}`);
+                    console.log(`尝试链接 ${i + 1}/${linksToTry.length}: ${linkId}`);
+                    try {
+                        const result = await page.evaluate(async ({ t, lid }) => {
+                            const res = await fetch(`https://api.pella.app/server/renew?id=${lid}`, {
+                                method: 'POST',
+                                headers: {
+                                    'Authorization': `Bearer ${t}`,
+                                    'Content-Type': 'application/json',
+                                    'Origin': 'https://www.pella.app',
+                                    'Referer': `https://pella.app/renew/${lid}`
+                                },
+                                body: '{}'
+                            });
+                            const text = await res.text();
+                            let data;
+                            try { data = JSON.parse(text); } catch { data = {}; }
+                            return { status: res.status, data };
+                        }, { t: token, lid: linkId });
 
-                        try {
-                            const result = await page.evaluate(async ({ t, lid }) => {
-                                const res = await fetch(`https://api.pella.app/server/renew?id=${lid}`, {
-                                    method: 'POST',
-                                    headers: {
-                                        'Authorization': `Bearer ${t}`,
-                                        'Content-Type': 'application/json',
-                                        'Origin': 'https://www.pella.app',
-                                        'Referer': `https://pella.app/renew/${lid}`
-                                    },
-                                    body: '{}'
-                                });
-                                const text = await res.text();
-                                let data;
-                                try { data = JSON.parse(text); } catch { data = {}; }
-                                return { status: res.status, data, text };
-                            }, { t: token, lid: linkId });
-
-                            console.log(`API 响应: ${result.status} ${JSON.stringify(result.data)}`);
-
-                            if (result.data.success) {
-                                successCount++;
-                                console.log(`✅ 续期成功`);
-                            } else if (result.data.error === 'Already claimed' || (result.data.message && result.data.message.includes('Already claimed'))) {
-                                claimedCount++;
-                                console.log(`ℹ️ 已认领过`);
-                            } else {
-                                failMessages.push(result.data.error || result.data.message || '未知错误');
-                            }
-                        } catch (e) {
-                            failMessages.push(e.message);
+                        console.log(`API 响应: ${result.status} ${JSON.stringify(result.data)}`);
+                        if (result.data.success) {
+                            successCount++;
+                            console.log(`✅ 续期成功`);
+                        } else if (result.data.error === 'Already claimed' || (result.data.message && result.data.message.includes('Already claimed'))) {
+                            claimedCount++;
+                            console.log(`ℹ️ 已认领过`);
+                        } else {
+                            failMessages.push(result.data.error || result.data.message || '未知错误');
                         }
-                        await sleep(500);
+                    } catch (e) {
+                        failMessages.push(e.message);
                     }
+                    await sleep(500);
                 }
 
                 let renewMsg = '';
                 if (successCount > 0) {
                     renewMsg = `续期成功(${successCount})`;
                     renewResults.push({ serverId, status: 'success', message: renewMsg });
-                } else if (claimedCount === linksToTry.length && linksToTry.length > 0) {
+                } else if (claimedCount > 0 && failMessages.length === 0) {
                     renewMsg = '广告冷却中';
                     renewResults.push({ serverId, status: 'claimed', message: renewMsg });
                 } else if (failMessages.length > 0) {
@@ -351,44 +429,28 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
                     renewResults.push({ serverId, status: 'no_links', message: renewMsg });
                 }
 
-                // ========== 3. 自动重启（解决进程暂停问题） ==========
-                console.log(`🔄 执行自动重启...`);
-                let restartOk = false;
-                try {
-                    const redeployResult = await page.evaluate(async ({ t, sid }) => {
-                        const res = await fetch('https://api.pella.app/server/redeploy', {
-                            method: 'POST',
-                            headers: {
-                                'Authorization': `Bearer ${t}`,
-                                'Content-Type': 'application/x-www-form-urlencoded',
-                                'Origin': 'https://www.pella.app',
-                                'Referer': 'https://www.pella.app/'
-                            },
-                            body: `id=${encodeURIComponent(sid)}`
-                        });
-                        const text = await res.text();
-                        return { status: res.status, text };
-                    }, { t: token, sid: serverId });
+                // ===== 智能重启判断 =====
+                const shouldRestart = await needRestart(page, token, serverId, server.status);
+                let restartMsg = '无需重启';
 
-                    console.log(`重启响应: HTTP ${redeployResult.status} ${redeployResult.text || '(空响应)'}`);
-
-                    // 空响应或 200 都视为成功
-                    if (redeployResult.status === 200 || !redeployResult.text || redeployResult.text.trim() === '') {
-                        console.log('✅ 重启指令已发送');
-                        restartOk = true;
+                if (shouldRestart) {
+                    console.log('🔄 满足重启条件，执行重启...');
+                    const ok = await doRestart(page, token, serverId);
+                    if (ok) {
                         totalRestartSuccess++;
+                        restartMsg = '已重启';
                     } else {
-                        console.log(`⚠️ 重启返回内容: ${redeployResult.text}`);
+                        restartMsg = '重启失败';
                     }
-                } catch (e) {
-                    console.log(`❌ 重启异常: ${e.message}`);
+                } else {
+                    totalRestartSkip++;
+                    console.log('⏭️ 进程正常，跳过重启');
                 }
 
-                // 把重启结果附加到 message
-                renewResults[renewResults.length - 1].message += ` | 重启${restartOk ? '成功' : '失败'}`;
+                renewResults[renewResults.length - 1].message += ` | ${restartMsg}`;
             }
 
-            // 重新获取最新服务器状态
+            // 最终剩余时间
             await sleep(1000);
             const finalServersRes = await page.evaluate(async (t) => {
                 const res = await fetch('https://api.pella.app/user/servers', {
@@ -398,7 +460,6 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
             }, token);
             const finalServers = finalServersRes.servers || servers;
 
-            // 汇总
             const successResults = renewResults.filter(r => r.status === 'success');
             const claimedResults = renewResults.filter(r => r.status === 'claimed');
             const failResults = renewResults.filter(r => r.status === 'fail');
@@ -414,12 +475,16 @@ test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => 
                 renewStatusText = `⚠️ 无可用续期链接`;
             }
 
-            const restartStatusText = totalRestartSuccess > 0
-                ? `✅ 成功 (${totalRestartSuccess} 台)`
-                : `❌ 失败`;
+            let restartStatusText = '';
+            if (totalRestartSuccess > 0) {
+                restartStatusText = `✅ 重启 ${totalRestartSuccess} 台`;
+            } else if (totalRestartSkip > 0) {
+                restartStatusText = `⏭️ 全部正常，无需重启`;
+            } else {
+                restartStatusText = `❌ 重启失败`;
+            }
 
-            const firstServer = finalServers[0] || {};
-            const remaining = calcRemaining(firstServer.expiry);
+            const remaining = calcRemaining(finalServers[0]?.expiry);
 
             summaryResults.push({
                 email,
