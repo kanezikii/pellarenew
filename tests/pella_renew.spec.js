@@ -2,7 +2,6 @@
 const { test, chromium } = require('@playwright/test');
 const https = require('https');
 const http = require('http');
-const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -54,11 +53,10 @@ function nowStr() {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── 计算剩余时间（和 worker 一致） ───────────────────────────
+// ── 计算剩余时间 ────────────────────────────────────────────
 function calcRemaining(expiry) {
     if (!expiry) return 'N/A';
     try {
-        // 支持 "HH:MM:SS DD/MM/YYYY" 或 ISO 等格式
         let expiryDate;
         const match = String(expiry).match(/(\d{2}):(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{4})/);
         if (match) {
@@ -80,7 +78,7 @@ function calcRemaining(expiry) {
     }
 }
 
-// ── Telegram 通知（参考 worker 格式） ───────────────────────
+// ── Telegram 通知 ───────────────────────────────────────────
 function sendSummaryTG(results) {
     return new Promise((resolve) => {
         if (!TG_CHAT_ID || !TG_TOKEN) {
@@ -88,7 +86,7 @@ function sendSummaryTG(results) {
             return resolve();
         }
         const lines = [
-            `📋 Pella 自动续期报告`,
+            `📋 Pella 自动续期 + 重启报告`,
             `🕐 ${nowStr()}`,
             `──────────────────────────`,
         ];
@@ -97,7 +95,8 @@ function sendSummaryTG(results) {
             if (item.error) {
                 lines.push(`❌ ${item.error}`);
             } else {
-                lines.push(`📊 ${item.status}`);
+                lines.push(`📊 续期: ${item.renewStatus}`);
+                lines.push(`🔄 重启: ${item.restartStatus}`);
                 if (item.expiry) lines.push(`⏳ 剩余: ${item.expiry}`);
                 if (item.detail) lines.push(`ℹ️ ${item.detail}`);
             }
@@ -124,8 +123,8 @@ function sendSummaryTG(results) {
 }
 
 // ── 主测试 ──────────────────────────────────────────────────
-test('Pella 多账号自动续期（纯 API 版）', async () => {
-    test.setTimeout(180000); // 3 分钟足够
+test('Pella 多账号自动续期 + 自动重启（纯 API 版）', async () => {
+    test.setTimeout(180000);
 
     if (accounts.length === 0) {
         throw new Error('❌ 未找到任何账号配置，请检查 PELLA_ACCOUNTS');
@@ -172,7 +171,6 @@ test('Pella 多账号自动续期（纯 API 版）', async () => {
         const page = await context.newPage();
         page.setDefaultTimeout(TIMEOUT);
         let token = null;
-        let servers = [];
 
         try {
             // 登录拿 Token
@@ -233,16 +231,17 @@ test('Pella 多账号自动续期（纯 API 版）', async () => {
                 });
                 return await res.json();
             }, token);
-            servers = serversRes.servers || [];
+            const servers = serversRes.servers || [];
             if (servers.length === 0) throw new Error('未找到服务器');
-
             console.log(`🖥️ 共 ${servers.length} 台服务器`);
 
-            // ========== 纯 API 续期（核心） ==========
+            // ========== 纯 API 续期 + 自动重启 ==========
             const renewResults = [];
+            let totalRestartSuccess = 0;
+
             for (const server of servers) {
                 const serverId = server.id || server._id;
-                console.log(`\n处理服务器 ${serverId}`);
+                console.log(`\n处理服务器 ${serverId} (当前状态: ${server.status || '未知'})`);
 
                 // 1. 刷新广告链接
                 console.log(`调用 renew/update 刷新广告链接...`);
@@ -288,70 +287,108 @@ test('Pella 多账号自动续期（纯 API 版）', async () => {
                 const linksToTry = availableLinks.length > 0 ? availableLinks : renewLinks;
                 console.log(`可用未认领链接: ${availableLinks.length}`);
 
-                if (linksToTry.length === 0) {
-                    renewResults.push({ serverId, status: 'no_links', message: '无续期链接' });
-                    continue;
-                }
-
                 let successCount = 0;
                 let claimedCount = 0;
                 const failMessages = [];
 
-                for (let i = 0; i < linksToTry.length; i++) {
-                    const linkObj = linksToTry[i];
-                    const linkUrl = typeof linkObj === 'string' ? linkObj : (linkObj.link || '');
-                    const linkId = linkUrl.split('/renew/')[1];
-                    if (!linkId) continue;
+                if (linksToTry.length > 0) {
+                    for (let i = 0; i < linksToTry.length; i++) {
+                        const linkObj = linksToTry[i];
+                        const linkUrl = typeof linkObj === 'string' ? linkObj : (linkObj.link || '');
+                        const linkId = linkUrl.split('/renew/')[1];
+                        if (!linkId) continue;
 
-                    console.log(`尝试链接 ${i + 1}/${linksToTry.length}: ${linkId}`);
+                        console.log(`尝试链接 ${i + 1}/${linksToTry.length}: ${linkId}`);
 
-                    try {
-                        const result = await page.evaluate(async ({ t, lid }) => {
-                            const res = await fetch(`https://api.pella.app/server/renew?id=${lid}`, {
-                                method: 'POST',
-                                headers: {
-                                    'Authorization': `Bearer ${t}`,
-                                    'Content-Type': 'application/json',
-                                    'Origin': 'https://www.pella.app',
-                                    'Referer': `https://pella.app/renew/${lid}`
-                                },
-                                body: '{}'
-                            });
-                            const text = await res.text();
-                            let data;
-                            try { data = JSON.parse(text); } catch { data = {}; }
-                            return { status: res.status, data, text };
-                        }, { t: token, lid: linkId });
+                        try {
+                            const result = await page.evaluate(async ({ t, lid }) => {
+                                const res = await fetch(`https://api.pella.app/server/renew?id=${lid}`, {
+                                    method: 'POST',
+                                    headers: {
+                                        'Authorization': `Bearer ${t}`,
+                                        'Content-Type': 'application/json',
+                                        'Origin': 'https://www.pella.app',
+                                        'Referer': `https://pella.app/renew/${lid}`
+                                    },
+                                    body: '{}'
+                                });
+                                const text = await res.text();
+                                let data;
+                                try { data = JSON.parse(text); } catch { data = {}; }
+                                return { status: res.status, data, text };
+                            }, { t: token, lid: linkId });
 
-                        console.log(`API 响应: ${result.status} ${JSON.stringify(result.data)}`);
+                            console.log(`API 响应: ${result.status} ${JSON.stringify(result.data)}`);
 
-                        if (result.data.success) {
-                            successCount++;
-                            console.log(`✅ 续期成功`);
-                        } else if (result.data.error === 'Already claimed' || (result.data.message && result.data.message.includes('Already claimed'))) {
-                            claimedCount++;
-                            console.log(`ℹ️ 已认领过`);
-                        } else {
-                            failMessages.push(result.data.error || result.data.message || '未知错误');
+                            if (result.data.success) {
+                                successCount++;
+                                console.log(`✅ 续期成功`);
+                            } else if (result.data.error === 'Already claimed' || (result.data.message && result.data.message.includes('Already claimed'))) {
+                                claimedCount++;
+                                console.log(`ℹ️ 已认领过`);
+                            } else {
+                                failMessages.push(result.data.error || result.data.message || '未知错误');
+                            }
+                        } catch (e) {
+                            failMessages.push(e.message);
                         }
-                    } catch (e) {
-                        failMessages.push(e.message);
+                        await sleep(500);
                     }
-                    await sleep(500);
                 }
 
+                let renewMsg = '';
                 if (successCount > 0) {
-                    renewResults.push({ serverId, status: 'success', message: `续期成功(${successCount}/${linksToTry.length})` });
-                } else if (claimedCount === linksToTry.length) {
-                    renewResults.push({ serverId, status: 'claimed', message: '广告冷却中' });
+                    renewMsg = `续期成功(${successCount})`;
+                    renewResults.push({ serverId, status: 'success', message: renewMsg });
+                } else if (claimedCount === linksToTry.length && linksToTry.length > 0) {
+                    renewMsg = '广告冷却中';
+                    renewResults.push({ serverId, status: 'claimed', message: renewMsg });
                 } else if (failMessages.length > 0) {
-                    renewResults.push({ serverId, status: 'fail', message: failMessages.join('; ') });
+                    renewMsg = failMessages.join('; ');
+                    renewResults.push({ serverId, status: 'fail', message: renewMsg });
                 } else {
-                    renewResults.push({ serverId, status: 'no_links', message: '无可用链接' });
+                    renewMsg = '无可用链接';
+                    renewResults.push({ serverId, status: 'no_links', message: renewMsg });
                 }
+
+                // ========== 3. 自动重启（解决进程暂停问题） ==========
+                console.log(`🔄 执行自动重启...`);
+                let restartOk = false;
+                try {
+                    const redeployResult = await page.evaluate(async ({ t, sid }) => {
+                        const res = await fetch('https://api.pella.app/server/redeploy', {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': `Bearer ${t}`,
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                                'Origin': 'https://www.pella.app',
+                                'Referer': 'https://www.pella.app/'
+                            },
+                            body: `id=${encodeURIComponent(sid)}`
+                        });
+                        const text = await res.text();
+                        return { status: res.status, text };
+                    }, { t: token, sid: serverId });
+
+                    console.log(`重启响应: HTTP ${redeployResult.status} ${redeployResult.text || '(空响应)'}`);
+
+                    // 空响应或 200 都视为成功
+                    if (redeployResult.status === 200 || !redeployResult.text || redeployResult.text.trim() === '') {
+                        console.log('✅ 重启指令已发送');
+                        restartOk = true;
+                        totalRestartSuccess++;
+                    } else {
+                        console.log(`⚠️ 重启返回内容: ${redeployResult.text}`);
+                    }
+                } catch (e) {
+                    console.log(`❌ 重启异常: ${e.message}`);
+                }
+
+                // 把重启结果附加到 message
+                renewResults[renewResults.length - 1].message += ` | 重启${restartOk ? '成功' : '失败'}`;
             }
 
-            // 重新获取最新服务器状态（拿最新 expiry）
+            // 重新获取最新服务器状态
             await sleep(1000);
             const finalServersRes = await page.evaluate(async (t) => {
                 const res = await fetch('https://api.pella.app/user/servers', {
@@ -366,36 +403,44 @@ test('Pella 多账号自动续期（纯 API 版）', async () => {
             const claimedResults = renewResults.filter(r => r.status === 'claimed');
             const failResults = renewResults.filter(r => r.status === 'fail');
 
-            let statusText = '';
+            let renewStatusText = '';
             if (successResults.length > 0) {
-                statusText = `✅ 续期成功 (${successResults.length} 台)`;
+                renewStatusText = `✅ 续期成功 (${successResults.length} 台)`;
             } else if (claimedResults.length > 0 && failResults.length === 0) {
-                statusText = `ℹ️ 广告冷却中`;
+                renewStatusText = `ℹ️ 广告冷却中`;
             } else if (failResults.length > 0) {
-                statusText = `❌ 续期失败`;
+                renewStatusText = `❌ 续期失败`;
             } else {
-                statusText = `⚠️ 无可用续期链接`;
+                renewStatusText = `⚠️ 无可用续期链接`;
             }
 
-            // 取第一台服务器的剩余时间
+            const restartStatusText = totalRestartSuccess > 0
+                ? `✅ 成功 (${totalRestartSuccess} 台)`
+                : `❌ 失败`;
+
             const firstServer = finalServers[0] || {};
             const remaining = calcRemaining(firstServer.expiry);
 
             summaryResults.push({
                 email,
-                status: statusText,
+                renewStatus: renewStatusText,
+                restartStatus: restartStatusText,
                 expiry: remaining,
-                detail: renewResults.map(r => `${r.serverId}: ${r.message}`).join(' | ')
+                detail: renewResults.map(r => `${r.serverId.slice(-6)}: ${r.message}`).join(' | ')
             });
 
-            console.log(`\n✅ 账号 ${email} 处理完成 → ${statusText}，剩余: ${remaining}`);
+            console.log(`\n✅ 账号 ${email} 处理完成`);
+            console.log(`   续期: ${renewStatusText}`);
+            console.log(`   重启: ${restartStatusText}`);
+            console.log(`   剩余: ${remaining}`);
 
         } catch (e) {
             console.log(`❌ 账号 ${email} 异常: ${e.message}`);
             summaryResults.push({
                 email,
                 error: e.message,
-                status: '脚本异常',
+                renewStatus: '脚本异常',
+                restartStatus: '脚本异常',
                 expiry: 'N/A'
             });
         } finally {
