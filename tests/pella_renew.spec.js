@@ -120,158 +120,98 @@ function sendSummaryTG(results) {
     });
 }
 
-// ── 智能判断是否需要重启（轮询等待页面真正加载） ─────────────
+// ── 探测版：抓取日志接口 / WebSocket（方案 C 第一步） ───────
 async function needRestart(page, serverId, apiStatus) {
-    const status = (apiStatus || '').toLowerCase();
-    
-    if (status && status !== 'running' && status !== 'online') {
-        console.log(`⚠️ API 状态为 "${apiStatus}"，需要重启`);
-        return true;
-    }
+    console.log('🔍 开始探测日志来源（方案 C）...');
+
+    const networkLogs = [];
+    const wsLogs = [];
+
+    // 监听所有请求
+    page.on('request', req => {
+        const url = req.url();
+        if (url.includes('pella') || url.includes('api') || url.includes('log') || url.includes('console') || url.includes('ws') || url.includes('socket')) {
+            networkLogs.push(`→ ${req.method()} ${url}`);
+        }
+    });
+
+    // 监听所有响应
+    page.on('response', async res => {
+        const url = res.url();
+        if (url.includes('pella') || url.includes('api') || url.includes('log') || url.includes('console')) {
+            let body = '';
+            try {
+                const ct = res.headers()['content-type'] || '';
+                if (ct.includes('json') || ct.includes('text')) {
+                    body = (await res.text()).substring(0, 300);
+                }
+            } catch (e) {}
+            networkLogs.push(`← ${res.status()} ${url} | ${body.replace(/\n/g, ' ').substring(0, 150)}`);
+        }
+    });
+
+    // 监听 WebSocket
+    page.on('websocket', ws => {
+        console.log(`【WebSocket 连接】 ${ws.url()}`);
+        wsLogs.push(`WS 连接: ${ws.url()}`);
+        
+        ws.on('framereceived', frame => {
+            const payload = (frame.payload || '').toString().substring(0, 200);
+            if (payload) {
+                console.log(`【WS 收到】 ${payload}`);
+                wsLogs.push(`WS 收到: ${payload}`);
+            }
+        });
+        
+        ws.on('framesent', frame => {
+            const payload = (frame.payload || '').toString().substring(0, 100);
+            if (payload) {
+                wsLogs.push(`WS 发送: ${payload}`);
+            }
+        });
+    });
 
     try {
-        // 1. 先回首页
-        console.log('🏠 先进入首页 https://www.pella.app/home');
+        // 回首页再进服务
         await page.goto('https://www.pella.app/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await sleep(3000);
+        await sleep(2000);
 
-        // 2. 进入服务页面
         const targetUrl = `https://www.pella.app/server/${serverId}`;
-        console.log(`🔍 进入服务: ${targetUrl}`);
+        console.log(`进入服务页: ${targetUrl}`);
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
         await sleep(3000);
 
-        // 3. 刷新一次
-        console.log('🔄 刷新页面...');
+        // 刷新一次
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
-        await sleep(3000);
+        
+        // 多等一会让 WS / 日志加载
+        console.log('等待 15 秒收集网络和 WS 数据...');
+        await sleep(15000);
 
-        // 4. 轮询等待 CONSOLE 或 RUNNING 状态出现（最多 20 秒）
-        console.log('⏳ 轮询等待 CONSOLE / RUNNING 状态加载...');
-        let pageInfo = null;
-        const maxTry = 10; // 10 次 × 2 秒 = 20 秒
+        // 再尝试点一下 CONSOLE 区域
+        try {
+            await page.click('text=CONSOLE', { timeout: 3000 }).catch(() => {});
+            await sleep(3000);
+        } catch (e) {}
 
-        for (let i = 0; i < maxTry; i++) {
-            pageInfo = await page.evaluate(() => {
-                const bodyText = (document.body.innerText || '').toLowerCase();
-                
-                const hasPending = bodyText.includes('pending');
-                const hasRunning = bodyText.includes('running') && !bodyText.includes('pending');
-                const hasStartBtn = Array.from(document.querySelectorAll('button')).some(btn => 
-                    (btn.innerText || '').trim().toUpperCase() === 'START'
-                );
-                const hasStopBtn = Array.from(document.querySelectorAll('button')).some(btn => 
-                    (btn.innerText || '').trim().toUpperCase() === 'STOP'
-                );
-
-                let consoleText = '';
-                const selectors = [
-                    'pre.relative.h-full.overflow-auto',
-                    'pre.bg-black',
-                    'pre.relative.h-full',
-                    'pre'
-                ];
-                for (const sel of selectors) {
-                    const el = document.querySelector(sel);
-                    if (el) {
-                        const t = (el.innerText || el.textContent || '').trim();
-                        if (t.length > 10) {
-                            consoleText = t;
-                            break;
-                        }
-                    }
-                }
-
-                return { hasPending, hasRunning, hasStartBtn, hasStopBtn, consoleText };
-            });
-
-            const text = (pageInfo.consoleText || '').toLowerCase();
-            const hasHealthy = [
-                'komari', 'is running', 'php is running', 'web is running',
-                'argo_domain', 'empowerment', 'get ipv4', 'websocket', 'download'
-            ].some(k => text.includes(k));
-
-            console.log(`  第${i + 1}次检查 → RUNNING:${pageInfo.hasRunning} START:${pageInfo.hasStartBtn} STOP:${pageInfo.hasStopBtn} CONSOLE长度:${text.length}`);
-
-            // 已经出现健康日志 或 明确是 RUNNING + 有 STOP 按钮 → 可以结束等待
-            if (hasHealthy || (pageInfo.hasRunning && pageInfo.hasStopBtn && !pageInfo.hasStartBtn)) {
-                console.log('✅ 页面状态已稳定');
-                break;
-            }
-
-            await sleep(2000);
+        // 输出收集结果
+        console.log('\n========== 网络请求汇总 ==========');
+        networkLogs.forEach(l => console.log(l));
+        
+        console.log('\n========== WebSocket 汇总 ==========');
+        if (wsLogs.length === 0) {
+            console.log('（没有捕获到 WebSocket）');
+        } else {
+            wsLogs.forEach(l => console.log(l));
         }
+        console.log('====================================\n');
 
-        const text = (pageInfo.consoleText || '').toLowerCase();
-        const preview = text.substring(0, 200).replace(/\n/g, ' ');
-        console.log(`CONSOLE 预览: ${preview || '(空)'}...`);
-        console.log(`最终检测 → PENDING:${pageInfo.hasPending} RUNNING:${pageInfo.hasRunning} START:${pageInfo.hasStartBtn} STOP:${pageInfo.hasStopBtn}`);
-
-        const healthyKeywords = [
-            'is running', 'php is running', 'web is running', 'bot is running', 'app is running',
-            'argo_domain', 'empowerment', 'private key', 'public key',
-            'komari', 'get ipv4', 'websocket', 'download',
-            'failed to connect', 'retrying', 'max retries reached'
-        ];
-        const hasNonStartLog = healthyKeywords.some(k => text.includes(k));
-
-        // 有正常日志 → 不重启
-        if (hasNonStartLog) {
-            console.log('✅ CONSOLE 存在非 start 的正常日志，无需重启');
-            return false;
-        }
-
-        // 明确是 RUNNING 且有 STOP 按钮 → 不重启
-        if (pageInfo.hasRunning && pageInfo.hasStopBtn && !pageInfo.hasStartBtn) {
-            console.log('✅ 页面显示 RUNNING + STOP，无需重启');
-            return false;
-        }
-
-        // PENDING 或有 START 按钮 → 重启
-        if (pageInfo.hasPending || pageInfo.hasStartBtn) {
-            console.log('⚠️ 页面显示 PENDING 或 START 按钮，需要重启');
-            return true;
-        }
-
-        // CONSOLE 为空
-        if (!text || text.length < 15) {
-            console.log('⚠️ CONSOLE 为空，需要重启');
-            return true;
-        }
-
-        console.log('ℹ️ 默认不重启');
+        // 探测阶段默认不重启
+        console.log('ℹ️ 探测完成，本次不执行重启');
         return false;
 
     } catch (e) {
-        console.log(`检查失败: ${e.message}，默认不重启`);
-        return false;
-    }
-}
-async function doRestart(page, token, serverId) {
-    try {
-        const result = await page.evaluate(async ({ t, sid }) => {
-            const res = await fetch('https://api.pella.app/server/redeploy', {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${t}`,
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Origin': 'https://www.pella.app',
-                    'Referer': 'https://www.pella.app/'
-                },
-                body: `id=${encodeURIComponent(sid)}`
-            });
-            const text = await res.text();
-            return { status: res.status, text };
-        }, { t: token, sid: serverId });
-
-        console.log(`重启响应: HTTP ${result.status} ${result.text || '(空)'}`);
-        if (result.status === 200 || !result.text || result.text.trim() === '') {
-            console.log('✅ 重启指令已发送');
-            return true;
-        }
-        return false;
-    } catch (e) {
-        console.log(`重启异常: ${e.message}`);
+        console.log(`探测失败: ${e.message}`);
         return false;
     }
 }
