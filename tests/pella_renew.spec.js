@@ -117,7 +117,7 @@ function sendSummaryTG(results) {
     });
 }
 
-// ── 智能判断是否需要重启（保守策略） ───────────────────────
+// ── 智能判断是否需要重启 ────────────────────────────────────
 async function needRestart(page, token, serverId, apiStatus) {
     const status = (apiStatus || '').toLowerCase();
     
@@ -131,10 +131,23 @@ async function needRestart(page, token, serverId, apiStatus) {
         const overviewUrl = `https://www.pella.app/server/${serverId}/overview`;
         console.log(`🔍 检查 CONSOLE: ${overviewUrl}`);
         await page.goto(overviewUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-        await sleep(8000);
+        
+        // 先等页面基础加载
+        await sleep(5000);
+        console.log('⏳ 额外等待 5 秒，确保页面完整加载...');
+        await sleep(5000);  // 再等 5 秒
 
-        // 尝试提取
-        const consoleText = await page.evaluate(() => {
+        // 检查页面是否显示 PENDING 或 START 按钮
+        const pageInfo = await page.evaluate(() => {
+            const bodyText = (document.body.innerText || '').toLowerCase();
+            
+            const hasPending = bodyText.includes('pending');
+            
+            const hasStartBtn = Array.from(document.querySelectorAll('button')).some(btn => 
+                (btn.innerText || '').trim().toUpperCase() === 'START'
+            );
+
+            let consoleText = '';
             const selectors = [
                 'pre.relative.h-full.overflow-auto',
                 'pre.bg-black',
@@ -145,15 +158,20 @@ async function needRestart(page, token, serverId, apiStatus) {
                 const el = document.querySelector(sel);
                 if (el) {
                     const t = (el.innerText || el.textContent || '').trim();
-                    if (t.length > 15) return t;
+                    if (t.length > 10) {
+                        consoleText = t;
+                        break;
+                    }
                 }
             }
-            return '';
-        }).catch(() => '');
 
-        const text = (consoleText || '').toLowerCase();
-        const preview = text.substring(0, 200).replace(/\n/g, ' ');
+            return { hasPending, hasStartBtn, consoleText };
+        });
+
+        const text = (pageInfo.consoleText || '').toLowerCase();
+        const preview = text.substring(0, 180).replace(/\n/g, ' ');
         console.log(`CONSOLE 预览: ${preview || '(空)'}...`);
+        console.log(`页面状态检测 → PENDING: ${pageInfo.hasPending}, START按钮: ${pageInfo.hasStartBtn}`);
 
         // 健康特征
         const healthySignals = [
@@ -161,7 +179,6 @@ async function needRestart(page, token, serverId, apiStatus) {
             'argo_domain', 'empowerment', 'private key', 'komari',
             'get ipv4', 'websocket', 'download'
         ];
-
         const hasHealthy = healthySignals.some(sig => text.includes(sig));
 
         if (hasHealthy) {
@@ -169,19 +186,25 @@ async function needRestart(page, token, serverId, apiStatus) {
             return false;
         }
 
-        // 只有在明确只有 starting，且内容很短时才重启
-        if (text.includes('starting') && text.length < 100 && !hasHealthy) {
+        // 页面显示 PENDING 或有 START 按钮 → 需要重启
+        if (pageInfo.hasPending || pageInfo.hasStartBtn) {
+            console.log('⚠️ 页面显示 PENDING 或存在 START 按钮，需要重启');
+            return true;
+        }
+
+        // 明确只有 starting
+        if (text.includes('starting') && text.length < 120 && !hasHealthy) {
             console.log('⚠️ 明确只有 starting，需要重启');
             return true;
         }
 
-        // 内容完全为空时，默认不重启（自动化环境经常抓不到动态日志）
+        // CONSOLE 为空
         if (!text || text.length < 20) {
-            console.log('ℹ️ CONSOLE 提取为空（可能是动态加载），默认不重启');
+            console.log('⚠️ CONSOLE 为空且无健康日志，需要重启');
             try {
                 await page.screenshot({ path: `console_empty_${serverId.slice(-6)}_${Date.now()}.png`, fullPage: false });
             } catch (e) {}
-            return false;
+            return true;
         }
 
         console.log('ℹ️ 未匹配到明确需要重启的特征，跳过重启');
