@@ -20,6 +20,9 @@ const accounts = Array.from(accountsMap.entries());
 const [TG_CHAT_ID, TG_TOKEN] = (process.env.TG_BOT || ',').split(',');
 const TIMEOUT = 60000;
 
+// 代理配置（优先用 PROXY_URL，其次 GOST_PROXY）
+const PROXY_URL = process.env.PROXY_URL || process.env.GOST_PROXY || '';
+
 function updateSavedAccountSecret(email, newSecret) {
     accountsMap.set(email, newSecret);
     const updatedList = [];
@@ -117,7 +120,7 @@ function sendSummaryTG(results) {
     });
 }
 
-// ── 智能判断是否需要重启（从首页重新进入服务） ───────────────
+// ── 智能判断是否需要重启（首页进入 + 刷新页面） ─────────────
 async function needRestart(page, serverId, apiStatus) {
     const status = (apiStatus || '').toLowerCase();
     
@@ -127,19 +130,21 @@ async function needRestart(page, serverId, apiStatus) {
     }
 
     try {
-        // 1. 先回到首页
+        // 1. 先回首页
         console.log('🏠 先进入首页 https://www.pella.app/home');
         await page.goto('https://www.pella.app/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
         await sleep(3000);
 
-        // 2. 再进入具体服务
+        // 2. 进入服务页面
         const targetUrl = `https://www.pella.app/server/${serverId}`;
-        console.log(`🔍 重新进入服务: ${targetUrl}`);
+        console.log(`🔍 进入服务: ${targetUrl}`);
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-        
-        await sleep(5000);
-        console.log('⏳ 额外等待 5 秒，确保 CONSOLE 加载完成...');
-        await sleep(5000);
+        await sleep(4000);
+
+        // 3. 刷新页面（你要求增加的步骤）
+        console.log('🔄 刷新页面，确保 CONSOLE 最新状态...');
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
+        await sleep(6000);
 
         const pageInfo = await page.evaluate(() => {
             const bodyText = (document.body.innerText || '').toLowerCase();
@@ -149,7 +154,6 @@ async function needRestart(page, serverId, apiStatus) {
                 (btn.innerText || '').trim().toUpperCase() === 'START'
             );
 
-            // 提取 CONSOLE 内容
             let consoleText = '';
             const selectors = [
                 'pre.relative.h-full.overflow-auto',
@@ -176,47 +180,30 @@ async function needRestart(page, serverId, apiStatus) {
         console.log(`CONSOLE 预览: ${preview || '(空)'}...`);
         console.log(`页面检测 → PENDING: ${pageInfo.hasPending}, START按钮: ${pageInfo.hasStartBtn}`);
 
-        // 健康关键词（非 start 的正常运行日志）
         const healthyKeywords = [
-            'is running',
-            'php is running',
-            'web is running',
-            'bot is running',
-            'app is running',
-            'argo_domain',
-            'empowerment',
-            'private key',
-            'public key',
-            'komari',
-            'get ipv4',
-            'websocket',
-            'download',
-            'failed to connect',
-            'retrying',
-            'max retries reached'
+            'is running', 'php is running', 'web is running', 'bot is running', 'app is running',
+            'argo_domain', 'empowerment', 'private key', 'public key',
+            'komari', 'get ipv4', 'websocket', 'download',
+            'failed to connect', 'retrying', 'max retries reached'
         ];
 
         const hasNonStartLog = healthyKeywords.some(k => text.includes(k));
 
-        // 有非 start 的正常日志 → 不重启
         if (hasNonStartLog) {
             console.log('✅ CONSOLE 存在非 start 的正常日志，无需重启');
             return false;
         }
 
-        // 页面显示 PENDING 或 START 按钮 → 重启
         if (pageInfo.hasPending || pageInfo.hasStartBtn) {
             console.log('⚠️ 页面显示 PENDING 或 START 按钮，需要重启');
             return true;
         }
 
-        // CONSOLE 为空
         if (!text || text.length < 15) {
             console.log('⚠️ CONSOLE 为空，需要重启');
             return true;
         }
 
-        // 只有 start 相关
         if (text.includes('start') && !hasNonStartLog) {
             console.log('⚠️ CONSOLE 只有 start 相关内容，需要重启');
             return true;
@@ -231,7 +218,6 @@ async function needRestart(page, serverId, apiStatus) {
     }
 }
 
-// ── 执行重启 ────────────────────────────────────────────────
 async function doRestart(page, token, serverId) {
     try {
         const result = await page.evaluate(async ({ t, sid }) => {
@@ -276,23 +262,15 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
         console.log(`🚀 开始处理账号: ${email}`);
         console.log(`===========================================\n`);
 
+        // 代理设置
         let proxyConfig = undefined;
-        if (process.env.GOST_PROXY) {
-            try {
-                await new Promise((resolve, reject) => {
-                    const req = http.request({ host: '127.0.0.1', port: 8080, path: '/', method: 'GET', timeout: 3000 }, () => resolve());
-                    req.on('error', reject);
-                    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-                    req.end();
-                });
-                proxyConfig = { server: 'http://127.0.0.1:8080' };
-                console.log('🛡️ 本地代理连通，使用 GOST 转发');
-            } catch {
-                console.log('⚠️ 本地代理不可达，降级为直连');
-            }
+        if (PROXY_URL) {
+            console.log(`🛡️ 使用代理: ${PROXY_URL.replace(/\/\/.*@/, '//***@')}`);
+            // 支持 http:// 或 socks5://
+            proxyConfig = { server: PROXY_URL };
         }
 
-        console.log('🔧 启动浏览器（仅用于登录拿 Token）...');
+        console.log('🔧 启动浏览器...');
         const browser = await chromium.launch({
             headless: false,
             proxy: proxyConfig,
@@ -365,9 +343,7 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 const serverId = server.id || server._id;
                 console.log(`\n处理服务器 ${serverId} (API状态: ${server.status || '未知'})`);
 
-                // ========== 续期 + 重启判断同步进行 ==========
-                
-                // 1. 先刷新链接
+                // 续期
                 console.log(`调用 renew/update 刷新广告链接...`);
                 try {
                     await page.evaluate(async ({ t, sid }) => {
@@ -387,7 +363,6 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 }
                 await sleep(800);
 
-                // 2. 获取续期链接
                 let renewLinks = [];
                 try {
                     const detail = await page.evaluate(async ({ t, sid }) => {
@@ -414,7 +389,6 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 let claimedCount = 0;
                 const failMessages = [];
 
-                // 3. 执行续期
                 for (let i = 0; i < linksToTry.length; i++) {
                     const linkObj = linksToTry[i];
                     const linkUrl = typeof linkObj === 'string' ? linkObj : (linkObj.link || '');
@@ -471,7 +445,7 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                     renewResults.push({ serverId, status: 'no_links', message: renewMsg });
                 }
 
-                // 4. 同步进行重启判断
+                // 重启判断
                 console.log('🔄 同步进行重启判断...');
                 const shouldRestart = await needRestart(page, serverId, server.status);
                 let restartMsg = '无需重启';
@@ -493,7 +467,6 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 renewResults[renewResults.length - 1].message += ` | ${restartMsg}`;
             }
 
-            // 最终状态
             await sleep(1000);
             const finalServersRes = await page.evaluate(async (t) => {
                 const res = await fetch('https://api.pella.app/user/servers', {
