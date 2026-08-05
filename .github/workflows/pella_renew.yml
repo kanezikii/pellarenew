@@ -39,7 +39,7 @@ jobs:
           unzip -q Xray-linux-64.zip -d xray
           chmod +x xray/xray
 
-            - name: 📝 生成 Xray 配置
+      - name: 📝 生成 Xray 配置
         env:
           VMESS_LINK: ${{ secrets.VMESS_LINK }}
         run: |
