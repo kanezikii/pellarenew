@@ -120,7 +120,7 @@ function sendSummaryTG(results) {
     });
 }
 
-// ── 智能判断是否需要重启（首页进入 + 刷新页面） ─────────────
+// ── 智能判断是否需要重启（轮询等待页面真正加载） ─────────────
 async function needRestart(page, serverId, apiStatus) {
     const status = (apiStatus || '').toLowerCase();
     
@@ -139,46 +139,73 @@ async function needRestart(page, serverId, apiStatus) {
         const targetUrl = `https://www.pella.app/server/${serverId}`;
         console.log(`🔍 进入服务: ${targetUrl}`);
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-        await sleep(4000);
+        await sleep(3000);
 
-        // 3. 刷新页面（你要求增加的步骤）
-        console.log('🔄 刷新页面，确保 CONSOLE 最新状态...');
+        // 3. 刷新一次
+        console.log('🔄 刷新页面...');
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
-        await sleep(6000);
+        await sleep(3000);
 
-        const pageInfo = await page.evaluate(() => {
-            const bodyText = (document.body.innerText || '').toLowerCase();
-            
-            const hasPending = bodyText.includes('pending');
-            const hasStartBtn = Array.from(document.querySelectorAll('button')).some(btn => 
-                (btn.innerText || '').trim().toUpperCase() === 'START'
-            );
+        // 4. 轮询等待 CONSOLE 或 RUNNING 状态出现（最多 20 秒）
+        console.log('⏳ 轮询等待 CONSOLE / RUNNING 状态加载...');
+        let pageInfo = null;
+        const maxTry = 10; // 10 次 × 2 秒 = 20 秒
 
-            let consoleText = '';
-            const selectors = [
-                'pre.relative.h-full.overflow-auto',
-                'pre.bg-black',
-                'pre.relative.h-full',
-                'pre'
-            ];
-            for (const sel of selectors) {
-                const el = document.querySelector(sel);
-                if (el) {
-                    const t = (el.innerText || el.textContent || '').trim();
-                    if (t.length > 10) {
-                        consoleText = t;
-                        break;
+        for (let i = 0; i < maxTry; i++) {
+            pageInfo = await page.evaluate(() => {
+                const bodyText = (document.body.innerText || '').toLowerCase();
+                
+                const hasPending = bodyText.includes('pending');
+                const hasRunning = bodyText.includes('running') && !bodyText.includes('pending');
+                const hasStartBtn = Array.from(document.querySelectorAll('button')).some(btn => 
+                    (btn.innerText || '').trim().toUpperCase() === 'START'
+                );
+                const hasStopBtn = Array.from(document.querySelectorAll('button')).some(btn => 
+                    (btn.innerText || '').trim().toUpperCase() === 'STOP'
+                );
+
+                let consoleText = '';
+                const selectors = [
+                    'pre.relative.h-full.overflow-auto',
+                    'pre.bg-black',
+                    'pre.relative.h-full',
+                    'pre'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (t.length > 10) {
+                            consoleText = t;
+                            break;
+                        }
                     }
                 }
+
+                return { hasPending, hasRunning, hasStartBtn, hasStopBtn, consoleText };
+            });
+
+            const text = (pageInfo.consoleText || '').toLowerCase();
+            const hasHealthy = [
+                'komari', 'is running', 'php is running', 'web is running',
+                'argo_domain', 'empowerment', 'get ipv4', 'websocket', 'download'
+            ].some(k => text.includes(k));
+
+            console.log(`  第${i + 1}次检查 → RUNNING:${pageInfo.hasRunning} START:${pageInfo.hasStartBtn} STOP:${pageInfo.hasStopBtn} CONSOLE长度:${text.length}`);
+
+            // 已经出现健康日志 或 明确是 RUNNING + 有 STOP 按钮 → 可以结束等待
+            if (hasHealthy || (pageInfo.hasRunning && pageInfo.hasStopBtn && !pageInfo.hasStartBtn)) {
+                console.log('✅ 页面状态已稳定');
+                break;
             }
 
-            return { hasPending, hasStartBtn, consoleText };
-        });
+            await sleep(2000);
+        }
 
         const text = (pageInfo.consoleText || '').toLowerCase();
-        const preview = text.substring(0, 220).replace(/\n/g, ' ');
+        const preview = text.substring(0, 200).replace(/\n/g, ' ');
         console.log(`CONSOLE 预览: ${preview || '(空)'}...`);
-        console.log(`页面检测 → PENDING: ${pageInfo.hasPending}, START按钮: ${pageInfo.hasStartBtn}`);
+        console.log(`最终检测 → PENDING:${pageInfo.hasPending} RUNNING:${pageInfo.hasRunning} START:${pageInfo.hasStartBtn} STOP:${pageInfo.hasStopBtn}`);
 
         const healthyKeywords = [
             'is running', 'php is running', 'web is running', 'bot is running', 'app is running',
@@ -186,26 +213,29 @@ async function needRestart(page, serverId, apiStatus) {
             'komari', 'get ipv4', 'websocket', 'download',
             'failed to connect', 'retrying', 'max retries reached'
         ];
-
         const hasNonStartLog = healthyKeywords.some(k => text.includes(k));
 
+        // 有正常日志 → 不重启
         if (hasNonStartLog) {
             console.log('✅ CONSOLE 存在非 start 的正常日志，无需重启');
             return false;
         }
 
+        // 明确是 RUNNING 且有 STOP 按钮 → 不重启
+        if (pageInfo.hasRunning && pageInfo.hasStopBtn && !pageInfo.hasStartBtn) {
+            console.log('✅ 页面显示 RUNNING + STOP，无需重启');
+            return false;
+        }
+
+        // PENDING 或有 START 按钮 → 重启
         if (pageInfo.hasPending || pageInfo.hasStartBtn) {
             console.log('⚠️ 页面显示 PENDING 或 START 按钮，需要重启');
             return true;
         }
 
+        // CONSOLE 为空
         if (!text || text.length < 15) {
             console.log('⚠️ CONSOLE 为空，需要重启');
-            return true;
-        }
-
-        if (text.includes('start') && !hasNonStartLog) {
-            console.log('⚠️ CONSOLE 只有 start 相关内容，需要重启');
             return true;
         }
 
@@ -217,7 +247,6 @@ async function needRestart(page, serverId, apiStatus) {
         return false;
     }
 }
-
 async function doRestart(page, token, serverId) {
     try {
         const result = await page.evaluate(async ({ t, sid }) => {
