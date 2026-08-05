@@ -48,7 +48,7 @@ jobs:
           echo "✅ GOST 已启动，测试连通性..."
           curl -s -x http://127.0.0.1:8080 https://api.ipify.org
 
-            - name: 📥 下载 Xray
+      - name: 📥 下载 Xray
         run: |
           wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -q Xray-linux-64.zip -d xray
