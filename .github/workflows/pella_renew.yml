@@ -138,4 +138,4 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
           retain_days: 0
-          keep_minimum_runs: 3 # 保留最近 3 次运行记录，清理其余旧记录
+          keep_minimum_runs: 1 # 保留最近 3 次运行记录，清理其余旧记录
