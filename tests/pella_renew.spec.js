@@ -117,74 +117,94 @@ function sendSummaryTG(results) {
     });
 }
 
-// ── 检测是否需要重启 ────────────────────────────────────────
+// ── 智能判断是否需要重启（根据两个账号的不同日志特征） ──────
 async function needRestart(page, token, serverId, apiStatus) {
-    // 1. 先根据 API 状态判断
     const status = (apiStatus || '').toLowerCase();
-    if (status && status !== 'running') {
+    if (status && status !== 'running' && status !== 'online') {
         console.log(`⚠️ API 状态为 "${apiStatus}"，需要重启`);
         return true;
     }
 
-    // 2. 打开 overview 页面检查 CONSOLE 内容
     try {
         const overviewUrl = `https://www.pella.app/server/${serverId}/overview`;
         console.log(`🔍 检查 CONSOLE: ${overviewUrl}`);
         await page.goto(overviewUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await sleep(3500);
+        await sleep(4000);
 
         const consoleText = await page.evaluate(() => {
-            // 尝试多种方式获取控制台内容
-            const selectors = [
-                '[class*="console"]',
-                '[class*="Console"]',
-                'pre',
-                '.console-output',
-                '#console',
-                '[data-testid="console"]'
-            ];
-            for (const sel of selectors) {
-                const el = document.querySelector(sel);
-                if (el && el.innerText && el.innerText.trim().length > 5) {
-                    return el.innerText.trim();
+            // 优先找 CONSOLE 区域
+            const candidates = document.querySelectorAll('pre, [class*="console"], [class*="Console"], [class*="log"], div');
+            let best = '';
+            for (const el of candidates) {
+                const t = (el.innerText || '').trim();
+                if (t.length > best.length && (
+                    t.includes('CONSOLE') ||
+                    t.includes('Komari') ||
+                    t.includes('is running') ||
+                    t.includes('ARGO_DOMAIN') ||
+                    t.includes('starting') ||
+                    t.includes('WebSocket') ||
+                    t.includes('Empowerment')
+                )) {
+                    best = t;
                 }
             }
-            // 兜底：找包含 "CONSOLE" 标题附近的内容
-            const all = document.querySelectorAll('div, pre, section');
-            for (const el of all) {
-                if ((el.innerText || '').includes('CONSOLE') || (el.innerText || '').includes('Web server is running')) {
-                    return el.innerText.trim();
-                }
-            }
+            if (best) return best;
+            // 兜底
             return document.body.innerText || '';
         }).catch(() => '');
 
         const text = (consoleText || '').toLowerCase();
-        console.log(`CONSOLE 内容片段: ${text.substring(0, 120).replace(/\n/g, ' ')}...`);
+        const preview = text.substring(0, 150).replace(/\n/g, ' ');
+        console.log(`CONSOLE 预览: ${preview}...`);
 
-        // 判断是否异常
-        const isEmpty = text.trim().length < 20;
+        // ========== 健康特征（有这些就说明进程在跑，不重启） ==========
+        const healthySignals = [
+            'komari-错误/状态',           // gmail 账号正常日志
+            'komari',
+            'get ipv4 success',
+            'websocket',
+            'is running',                // outlook 账号
+            'php is running',
+            'web is running',
+            'bot is running',
+            'app is running',
+            'argo_domain',
+            'empowerment success',
+            'download',
+            'thank you for using this script'
+        ];
+
+        const hasHealthySignal = healthySignals.some(sig => text.includes(sig));
+
+        if (hasHealthySignal) {
+            console.log('✅ 检测到正常运行日志特征，无需重启');
+            return false;
+        }
+
+        // ========== 需要重启的情况 ==========
+        const isEmpty = text.trim().length < 30;
         const onlyStarting = (
-            text.includes('starting') ||
-            text.includes('启动') ||
-            text.includes('正在启动') ||
-            text.includes('pending')
-        ) && !text.includes('running') && !text.includes('listening') && !text.includes('web server is running');
+            (text.includes('starting') || text.includes('正在启动') || text.includes('pending')) &&
+            !hasHealthySignal
+        );
 
         if (isEmpty) {
-            console.log('⚠️ CONSOLE 为空，需要重启');
+            console.log('⚠️ CONSOLE 几乎为空，需要重启');
             return true;
         }
         if (onlyStarting) {
-            console.log('⚠️ CONSOLE 只有启动信息，需要重启');
+            console.log('⚠️ CONSOLE 只有 starting 信息，需要重启');
             return true;
         }
 
-        console.log('✅ CONSOLE 正常，无需重启');
+        // 默认保守：有内容但匹配不到已知健康特征时，也视为可能正常（避免误重启）
+        console.log('ℹ️ 未匹配到明确健康/异常特征，默认不重启');
         return false;
+
     } catch (e) {
-        console.log(`检查 CONSOLE 失败: ${e.message}，为安全起见执行重启`);
-        return true;
+        console.log(`检查 CONSOLE 失败: ${e.message}，默认不重启`);
+        return false;
     }
 }
 
@@ -285,13 +305,11 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 throw new Error('当前仅支持 Cookie 登录');
             }
 
-            // 等待 session
             for (let i = 0; i < 20; i++) {
                 if (await page.evaluate('!!(window.Clerk && window.Clerk.session)')) break;
                 await sleep(500);
             }
 
-            // 更新 Cookie
             try {
                 const latestCookies = await context.cookies(['https://www.pella.app', 'https://clerk.pella.app']);
                 const cookieStr = latestCookies.map(c => `${c.name}=${c.value}`).join('; ');
@@ -302,12 +320,10 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 console.log(`⚠️ 抓取最新 Cookie 失败: ${err.message}`);
             }
 
-            // 获取 Token
             console.log('🔑 获取 JWT token...');
             token = await page.evaluate('window.Clerk && window.Clerk.session ? window.Clerk.session.getToken() : null');
             if (!token) throw new Error('无法获取 Clerk token');
 
-            // 获取服务器
             console.log('🔍 获取服务器信息...');
             const serversRes = await page.evaluate(async (t) => {
                 const res = await fetch('https://api.pella.app/user/servers', {
@@ -327,7 +343,7 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 const serverId = server.id || server._id;
                 console.log(`\n处理服务器 ${serverId} (API状态: ${server.status || '未知'})`);
 
-                // ===== 续期 =====
+                // 续期
                 console.log(`调用 renew/update 刷新广告链接...`);
                 try {
                     await page.evaluate(async ({ t, sid }) => {
@@ -429,7 +445,7 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                     renewResults.push({ serverId, status: 'no_links', message: renewMsg });
                 }
 
-                // ===== 智能重启判断 =====
+                // 智能重启
                 const shouldRestart = await needRestart(page, token, serverId, server.status);
                 let restartMsg = '无需重启';
 
@@ -450,7 +466,7 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
                 renewResults[renewResults.length - 1].message += ` | ${restartMsg}`;
             }
 
-            // 最终剩余时间
+            // 最终状态
             await sleep(1000);
             const finalServersRes = await page.evaluate(async (t) => {
                 const res = await fetch('https://api.pella.app/user/servers', {
