@@ -120,98 +120,103 @@ function sendSummaryTG(results) {
     });
 }
 
-// ── 探测版：抓取日志接口 / WebSocket（方案 C 第一步） ───────
-async function needRestart(page, serverId, apiStatus) {
-    console.log('🔍 开始探测日志来源（方案 C）...');
-
-    const networkLogs = [];
-    const wsLogs = [];
-
-    // 监听所有请求
-    page.on('request', req => {
-        const url = req.url();
-        if (url.includes('pella') || url.includes('api') || url.includes('log') || url.includes('console') || url.includes('ws') || url.includes('socket')) {
-            networkLogs.push(`→ ${req.method()} ${url}`);
-        }
-    });
-
-    // 监听所有响应
-    page.on('response', async res => {
-        const url = res.url();
-        if (url.includes('pella') || url.includes('api') || url.includes('log') || url.includes('console')) {
-            let body = '';
-            try {
-                const ct = res.headers()['content-type'] || '';
-                if (ct.includes('json') || ct.includes('text')) {
-                    body = (await res.text()).substring(0, 300);
-                }
-            } catch (e) {}
-            networkLogs.push(`← ${res.status()} ${url} | ${body.replace(/\n/g, ' ').substring(0, 150)}`);
-        }
-    });
-
-    // 监听 WebSocket
-    page.on('websocket', ws => {
-        console.log(`【WebSocket 连接】 ${ws.url()}`);
-        wsLogs.push(`WS 连接: ${ws.url()}`);
-        
-        ws.on('framereceived', frame => {
-            const payload = (frame.payload || '').toString().substring(0, 200);
-            if (payload) {
-                console.log(`【WS 收到】 ${payload}`);
-                wsLogs.push(`WS 收到: ${payload}`);
-            }
-        });
-        
-        ws.on('framesent', frame => {
-            const payload = (frame.payload || '').toString().substring(0, 100);
-            if (payload) {
-                wsLogs.push(`WS 发送: ${payload}`);
-            }
-        });
-    });
+// ── 通过 logs API 判断是否需要重启（方案 C 最终版） ─────────
+async function needRestart(page, token, serverId, apiStatus) {
+    const status = (apiStatus || '').toLowerCase();
+    
+    if (status && status !== 'running' && status !== 'online') {
+        console.log(`⚠️ API 状态为 "${apiStatus}"，需要重启`);
+        return true;
+    }
 
     try {
-        // 回首页再进服务
-        await page.goto('https://www.pella.app/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await sleep(2000);
-
-        const targetUrl = `https://www.pella.app/server/${serverId}`;
-        console.log(`进入服务页: ${targetUrl}`);
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-        await sleep(3000);
-
-        // 刷新一次
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 });
+        console.log(`🔍 调用 logs API 检查进程状态: ${serverId}`);
         
-        // 多等一会让 WS / 日志加载
-        console.log('等待 15 秒收集网络和 WS 数据...');
-        await sleep(15000);
+        const logsResult = await page.evaluate(async ({ t, sid }) => {
+            const res = await fetch(`https://api.pella.app/server/logs?id=${sid}&use_cache=true`, {
+                headers: {
+                    'Authorization': `Bearer ${t}`,
+                    'Origin': 'https://www.pella.app',
+                    'Referer': 'https://www.pella.app/'
+                }
+            });
+            const text = await res.text();
+            let data;
+            try { data = JSON.parse(text); } catch { data = { raw: text }; }
+            return { status: res.status, data };
+        }, { t: token, sid: serverId });
 
-        // 再尝试点一下 CONSOLE 区域
-        try {
-            await page.click('text=CONSOLE', { timeout: 3000 }).catch(() => {});
-            await sleep(3000);
-        } catch (e) {}
+        console.log(`logs API 响应: HTTP ${logsResult.status}`);
 
-        // 输出收集结果
-        console.log('\n========== 网络请求汇总 ==========');
-        networkLogs.forEach(l => console.log(l));
-        
-        console.log('\n========== WebSocket 汇总 ==========');
-        if (wsLogs.length === 0) {
-            console.log('（没有捕获到 WebSocket）');
-        } else {
-            wsLogs.forEach(l => console.log(l));
+        if (logsResult.status !== 200) {
+            console.log(`⚠️ logs API 返回 ${logsResult.status}，为安全起见执行重启`);
+            return true;
         }
-        console.log('====================================\n');
 
-        // 探测阶段默认不重启
-        console.log('ℹ️ 探测完成，本次不执行重启');
+        // 提取日志文本
+        let logText = '';
+        const d = logsResult.data;
+        if (typeof d === 'string') {
+            logText = d;
+        } else if (d.logs) {
+            logText = Array.isArray(d.logs) ? d.logs.join('\n') : String(d.logs);
+        } else if (d.log) {
+            logText = Array.isArray(d.log) ? d.log.join('\n') : String(d.log);
+        } else if (d.data) {
+            logText = Array.isArray(d.data) ? d.data.join('\n') : String(d.data);
+        } else if (d.raw) {
+            logText = d.raw;
+        } else {
+            logText = JSON.stringify(d);
+        }
+
+        const text = (logText || '').toLowerCase();
+        const preview = text.substring(0, 250).replace(/\n/g, ' ');
+        console.log(`CONSOLE 日志预览: ${preview || '(空)'}...`);
+
+        // 健康关键词
+        const healthyKeywords = [
+            'is running',
+            'php is running',
+            'web is running',
+            'bot is running',
+            'app is running',
+            'argo_domain',
+            'empowerment',
+            'private key',
+            'public key',
+            'komari',
+            'get ipv4',
+            'websocket',
+            'download',
+            'failed to connect',
+            'retrying',
+            'max retries reached'
+        ];
+
+        const hasHealthy = healthyKeywords.some(k => text.includes(k));
+
+        if (hasHealthy) {
+            console.log('✅ logs 中存在正常运行日志，无需重启');
+            return false;
+        }
+
+        // 空日志或只有 starting
+        if (!text || text.trim().length < 20) {
+            console.log('⚠️ logs 为空，需要重启');
+            return true;
+        }
+
+        if (text.includes('starting') && !hasHealthy) {
+            console.log('⚠️ logs 只有 starting，需要重启');
+            return true;
+        }
+
+        console.log('ℹ️ 未匹配到明确异常，默认不重启');
         return false;
 
     } catch (e) {
-        console.log(`探测失败: ${e.message}`);
+        console.log(`logs API 检查失败: ${e.message}，默认不重启`);
         return false;
     }
 }
@@ -416,7 +421,7 @@ test('Pella 多账号自动续期 + 智能重启', async () => {
 
                 // 重启判断
                 console.log('🔄 同步进行重启判断...');
-                const shouldRestart = await needRestart(page, serverId, server.status);
+                const shouldRestart = await needRestart(page, token, serverId, server.status);
                 let restartMsg = '无需重启';
 
                 if (shouldRestart) {
